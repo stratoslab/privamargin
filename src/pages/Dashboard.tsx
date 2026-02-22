@@ -851,18 +851,116 @@ function RelayPanel() {
   );
 }
 
+// Operator Dashboard — platform overview with role counts and system status
+function OperatorDashboard({ user }: { user: AuthUser }) {
+  const { allRoles } = useRole();
+  const navigate = useNavigate();
+
+  const fundCount = Object.values(allRoles).filter(r => r === 'fund').length;
+  const brokerCount = Object.values(allRoles).filter(r => r === 'primebroker').length;
+  const operatorCount = Object.values(allRoles).filter(r => r === 'operator').length + 1; // +1 for primary operator
+  const totalParties = Object.keys(allRoles).length;
+
+  return (
+    <Box>
+      {/* Header */}
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 4 }}>
+        <Box>
+          <Typography sx={{ fontSize: 28, fontWeight: 600, color: 'white', mb: 0.5 }}>Operator Dashboard</Typography>
+          <Typography sx={{ fontSize: 14, color: 'rgba(255,255,255,0.5)' }}>
+            Platform administration and system status
+          </Typography>
+        </Box>
+        <Button
+          variant="contained"
+          onClick={() => navigate('/admin')}
+          sx={{
+            bgcolor: '#f59e0b',
+            color: '#0a0e14',
+            fontWeight: 600,
+            px: 3,
+            py: 1,
+            borderRadius: '8px',
+            textTransform: 'none',
+            '&:hover': { bgcolor: '#d97706' },
+          }}
+        >
+          Manage Roles
+        </Button>
+      </Box>
+
+      {/* Stats Cards */}
+      <Grid container spacing={2} sx={{ mb: 3 }}>
+        <Grid item xs={12} sm={6} md={3}>
+          <StatsCard
+            label="Funds"
+            value={fundCount.toString()}
+            sublabel="Registered fund accounts"
+            icon={<Box sx={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid #00d4aa' }} />}
+            iconBgColor="rgba(0, 212, 170, 0.1)"
+          />
+        </Grid>
+        <Grid item xs={12} sm={6} md={3}>
+          <StatsCard
+            label="Prime Brokers"
+            value={brokerCount.toString()}
+            sublabel="Active brokers"
+            icon={<Box sx={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid #8b5cf6' }} />}
+            iconBgColor="rgba(139, 92, 246, 0.1)"
+          />
+        </Grid>
+        <Grid item xs={12} sm={6} md={3}>
+          <StatsCard
+            label="Operators"
+            value={operatorCount.toString()}
+            sublabel="Platform administrators"
+            icon={<Box sx={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid #f59e0b' }} />}
+            iconBgColor="rgba(245, 158, 11, 0.1)"
+          />
+        </Grid>
+        <Grid item xs={12} sm={6} md={3}>
+          <StatsCard
+            label="Total Parties"
+            value={totalParties.toString()}
+            sublabel="All assigned roles"
+            icon={<Shield sx={{ color: '#60a5fa', fontSize: 20 }} />}
+            iconBgColor="rgba(96, 165, 250, 0.1)"
+          />
+        </Grid>
+      </Grid>
+
+      {/* Custodian + Relay Panels */}
+      <CustodianPanel />
+      <RelayPanel />
+
+      {/* Connected as */}
+      <Box
+        sx={{
+          bgcolor: '#111820',
+          borderRadius: '12px',
+          border: '1px solid rgba(245,158,11,0.15)',
+          p: 3,
+        }}
+      >
+        <Typography sx={{ fontSize: 14, fontWeight: 600, color: '#f59e0b', mb: 1 }}>Operator Identity</Typography>
+        <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+          {user.partyId || user.id}
+        </Typography>
+      </Box>
+    </Box>
+  );
+}
+
 export default function Dashboard({ user, assets }: DashboardProps) {
   const { isPrimeBroker, isOperator } = useRole();
+
+  if (isOperator) {
+    return <OperatorDashboard user={user} />;
+  }
 
   if (isPrimeBroker) {
     return <BrokerDashboard user={user} />;
   }
 
-  return (
-    <>
-      {isOperator && <CustodianPanel />}
-      {isOperator && <RelayPanel />}
-      <FundDashboard user={user} assets={assets} />
-    </>
-  );
+  return <FundDashboard user={user} assets={assets} />;
 }

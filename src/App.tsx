@@ -30,9 +30,9 @@ import BrokerFundLinks from './pages/BrokerFundLinks';
 
 // All menu items with role visibility
 const allMenuItems = [
-  { path: '/', label: 'Dashboard', icon: DashboardIcon, roles: ['fund', 'primebroker'] as string[] },
+  { path: '/', label: 'Dashboard', icon: DashboardIcon, roles: ['fund', 'primebroker', 'operator'] as string[] },
   { path: '/vaults', label: 'Vaults', icon: AccountBalance, roles: ['fund'] as string[] },
-{ path: '/positions', label: 'Positions', icon: TrendingUp, roles: ['fund', 'primebroker'] as string[] },
+  { path: '/positions', label: 'Positions', icon: TrendingUp, roles: ['fund', 'primebroker'] as string[] },
   { path: '/brokers', label: 'My Brokers', icon: Handshake, roles: ['fund'] as string[] },
   { path: '/funds', label: 'Client Accounts', icon: People, roles: ['primebroker'] as string[] },
   { path: '/margin', label: 'Margin Verification', icon: VerifiedUser, roles: ['fund', 'primebroker'] as string[] },
@@ -49,7 +49,8 @@ function Sidebar() {
   const location = useLocation();
   const { role, isOperator } = useRole();
 
-  const menuItems = allMenuItems.filter(item => !role || item.roles.includes(role));
+  const effectiveRole = isOperator ? 'operator' : role;
+  const menuItems = allMenuItems.filter(item => !effectiveRole || item.roles.includes(effectiveRole));
 
   // Only operator gets the admin link (brokers manage funds via Client Accounts)
   const showAdmin = isOperator;
