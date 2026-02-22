@@ -4,7 +4,7 @@ import { Add, Visibility, VisibilityOff, Lock, LockOpen, TrendingUp, Warning, Sh
 import { useNavigate } from 'react-router-dom';
 import { vaultAPI, marginAPI, invitationAPI, positionAPI, linkAPI, workflowMarginCallAPI, getCustodianParty } from '../services/api';
 import type { PositionData, BrokerFundLinkData, WorkflowMarginCallData } from '../services/api';
-import { CHAIN_CONFIG, CHAIN_NAME_TO_ID, CHAIN_ID_TO_NAME } from '../services/evmEscrow';
+import { CHAIN_CONFIG, CHAIN_ID_TO_NAME, CHAIN_TYPE_TO_IDS } from '../services/evmEscrow';
 import { useRole } from '../context/RoleContext';
 import { getSDK } from '@stratos-wallet/sdk';
 import type { AuthUser, Asset } from '@stratos-wallet/sdk';
@@ -758,15 +758,23 @@ function RelayPanel() {
     try {
       const sdk = getSDK();
       const addresses = await sdk.getAddresses();
-      // Filter EVM-compatible addresses (evm + base) and map chain names to chain IDs
+      // A single wallet address works on all chains of the same type.
+      // e.g. one "evm" address → Ethereum + Sepolia; one "base" address → Base + Base Sepolia
       const evmChains: Array<{ chainId: number; name: string; address: string }> = [];
-      const seenChainIds = new Set<number>();
+      const seenTypes = new Set<string>();
       for (const addr of addresses) {
-        if (addr.chainType === 'evm' || addr.chainType === 'base') {
-          const chainId = CHAIN_NAME_TO_ID[addr.chain];
-          if (chainId && !seenChainIds.has(chainId) && CHAIN_CONFIG[chainId]) {
-            seenChainIds.add(chainId);
-            evmChains.push({ chainId, name: addr.chain, address: addr.address });
+        const chainType = addr.chainType;
+        if ((chainType === 'evm' || chainType === 'base') && !seenTypes.has(chainType)) {
+          seenTypes.add(chainType);
+          const chainIds = CHAIN_TYPE_TO_IDS[chainType] || [];
+          for (const chainId of chainIds) {
+            if (CHAIN_CONFIG[chainId]) {
+              evmChains.push({
+                chainId,
+                name: CHAIN_ID_TO_NAME[chainId] || `Chain ${chainId}`,
+                address: addr.address,
+              });
+            }
           }
         }
       }
@@ -790,7 +798,9 @@ function RelayPanel() {
     setError('');
     setSuccess('');
     try {
-      const result = await vaultAPI.deployDepositRelay(chainId);
+      // Pass the wallet address for this chain so deploy doesn't re-query
+      const chain = walletChains.find(c => c.chainId === chainId);
+      const result = await vaultAPI.deployDepositRelay(chainId, chain?.address);
       setRelayAddresses(prev => ({ ...prev, [chainId]: result.data.contractAddress }));
       setSuccess(`Relay deployed on ${CHAIN_ID_TO_NAME[chainId] || chainId}: ${result.data.contractAddress.slice(0, 16)}...`);
     } catch (err) {

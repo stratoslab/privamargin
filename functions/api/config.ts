@@ -27,7 +27,7 @@ const DEFAULT_PLATFORM_ASSETS = [
 ];
 
 // Known relay chain IDs to load from KV
-const RELAY_CHAIN_IDS = [1, 11155111, 8453];
+const RELAY_CHAIN_IDS = [1, 11155111, 8453, 84532];
 
 export const onRequestGet: PagesFunction<Env> = async ({ env }) => {
   try {

@@ -904,14 +904,19 @@ export const vaultAPI = {
   },
 
   // Deploy a DepositRelay contract for a chain (operator only, one per chain)
-  deployDepositRelay: async (chainId: number) => {
+  deployDepositRelay: async (chainId: number, operatorAddress?: string) => {
     if (!sdk) throw new Error('SDK not available');
 
-    const addresses = await sdk.getAddresses();
-    const evmAddr = addresses.find(a => a.chainType === 'evm');
-    if (!evmAddr) throw new Error('No EVM address found for operator');
+    // Use provided address or look up from wallet
+    let opAddr = operatorAddress;
+    if (!opAddr) {
+      const addresses = await sdk.getAddresses();
+      const evmAddr = addresses.find(a => a.chainType === 'evm' || a.chainType === 'base');
+      if (!evmAddr) throw new Error('No EVM wallet found — ensure your account has an Ethereum or Base wallet');
+      opAddr = evmAddr.address;
+    }
 
-    const { contractAddress, txHash } = await deployDepositRelay(sdk, chainId, evmAddr.address);
+    const { contractAddress, txHash } = await deployDepositRelay(sdk, chainId, opAddr);
 
     // Store relay address in runtime config
     const chainConfig = CHAIN_CONFIG[chainId];

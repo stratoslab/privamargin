@@ -37,11 +37,20 @@ export const CHAIN_NAME_TO_ID: Record<string, number> = {
   'Ethereum': 1,
   'Sepolia': 11155111,
   'Base': 8453,
+  'Base Sepolia': 84532,
 };
 export const CHAIN_ID_TO_NAME: Record<number, string> = {
   1: 'Ethereum',
   11155111: 'Sepolia',
   8453: 'Base',
+  84532: 'Base Sepolia',
+};
+
+// Map wallet SDK chainType → all supported chain IDs for that type.
+// A single EVM address works on all EVM-compatible chains (mainnet + testnets).
+export const CHAIN_TYPE_TO_IDS: Record<string, number[]> = {
+  evm: [1, 11155111],        // Ethereum mainnet + Sepolia
+  base: [8453, 84532],       // Base mainnet + Base Sepolia
 };
 
 // ---------------------------------------------------------------------------
@@ -85,6 +94,7 @@ export const CHAIN_CONFIG: Record<number, ChainConfig> = {
   1:        { swapRouter: '0xE592427A0AEce92De3Edee1F18E0157C05861564', weth: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', usdc: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' },
   11155111: { swapRouter: '0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E', weth: '0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14', usdc: '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238' },
   8453:     { swapRouter: '0x2626664c2603336E57B271c5C0b26F421741e481', weth: '0x4200000000000000000000000000000000000006', usdc: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' },
+  84532:    { swapRouter: '0x94cC0AaC535CCDB3C01d6787D6413C739ae12bc4', weth: '0x4200000000000000000000000000000000000006', usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e' },
 };
 
 // ---------------------------------------------------------------------------
