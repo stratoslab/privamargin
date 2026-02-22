@@ -246,9 +246,13 @@ export async function deployEscrowContract(
     + padAddress(wethAddress)
     + padAddress(stablecoinAddress);
 
-  // Send deployment transaction (to is omitted → contract creation)
+  // Send deployment transaction (to = 0x → contract creation)
+  console.log('[EVM Escrow] Deploying on chain', chainId, 'liquidator:', liquidatorAddress);
+  console.log('[EVM Escrow] Available addresses:', await sdk.getAddresses());
+
   const result = await sdk.sendEVMTransaction({
     transaction: {
+      to: '0x',
       data: deployData,
       chainId,
     },
@@ -280,8 +284,12 @@ export async function deployDepositRelay(
 ): Promise<{ contractAddress: string; txHash: string }> {
   const deployData = DEPOSIT_RELAY_BYTECODE + padAddress(operatorAddress);
 
+  console.log('[DepositRelay] Deploying on chain', chainId, 'operator:', operatorAddress);
+  console.log('[DepositRelay] Available addresses:', await sdk.getAddresses());
+
   const result = await sdk.sendEVMTransaction({
     transaction: {
+      to: '0x',  // empty to = contract creation (some portals need this explicitly)
       data: deployData,
       chainId,
     },
