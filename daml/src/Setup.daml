@@ -1,0 +1,94 @@
+module Setup where
+
+import Daml.Script
+import Assets
+import CollateralVault
+import MarginVerification
+import Roles
+import BrokerFundLink qualified
+import Position qualified
+
+data Parties = Parties
+  with
+    institutionA: Party
+    institutionB: Party
+    operator: Party
+    issuer: Party
+
+setupParties : Script Parties
+setupParties = do
+  institutionA <- allocatePartyWithHint "InstitutionA" (PartyIdHint "InstitutionA")
+  institutionB <- allocatePartyWithHint "InstitutionB" (PartyIdHint "InstitutionB")
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "Operator")
+  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "Issuer")
+  return Parties with ..
+
+setupDemo : Script ()
+setupDemo = do
+  parties <- setupParties
+
+  -- Set up operator role contract
+  operatorRoleCid <- submit parties.operator $ createCmd OperatorRole with
+    operator = parties.operator
+
+  -- Operator assigns InstitutionB as Prime Broker
+  brokerAssignment <- submit parties.operator $ exerciseCmd operatorRoleCid AssignPrimeBroker with
+    broker = parties.institutionB
+
+  -- Create BrokerRole for InstitutionB
+  brokerRoleCid <- submitMulti [parties.operator, parties.institutionB] [] $ createCmd BrokerRole with
+    broker = parties.institutionB
+    operator = parties.operator
+
+  -- Prime broker (InstitutionB) assigns InstitutionA as Fund
+  fundAssignment <- submit parties.institutionB $ exerciseCmd brokerRoleCid BrokerAssignFund with
+    fund = parties.institutionA
+
+  -- Issue assets to Institution A (Fund)
+  asset1 <- submit parties.issuer $ createCmd AssetIssuance with
+    issuer = parties.issuer
+    recipient = parties.institutionA
+    assetId = "CC-001"
+    assetType = CantonCoin
+    amount = 500000.0
+    valueUSD = 500000.0
+
+  asset2 <- submit parties.issuer $ createCmd AssetIssuance with
+    issuer = parties.issuer
+    recipient = parties.institutionA
+    assetId = "BTC-001"
+    assetType = Cryptocurrency
+    amount = 5.26
+    valueUSD = 500000.0
+
+  -- Institution A accepts assets
+  assetCid1 <- submit parties.institutionA $ exerciseCmd asset1 Accept
+  assetCid2 <- submit parties.institutionA $ exerciseCmd asset2 Accept
+
+  -- Create vault for Institution A
+  vault <- submitMulti [parties.institutionA, parties.operator] [] $ createCmd CollateralVault with
+    owner = parties.institutionA
+    operator = parties.operator
+    vaultId = "VAULT-A-001"
+    collateralAssets = []
+    linkedPositions = []
+    chainVaults = None
+    depositRecords = None
+
+  -- Deposit assets into vault
+  vault2 <- submit parties.institutionA $ exerciseCmd vault DepositAsset with assetCid = assetCid1
+  vault3 <- submit parties.institutionA $ exerciseCmd vault2 DepositAsset with assetCid = assetCid2
+
+  -- Create margin requirement
+  marginReq <- submitMulti [parties.institutionA, parties.institutionB, parties.operator] [] $
+    createCmd MarginRequirement with
+      provider = parties.institutionA
+      counterparty = parties.institutionB
+      operator = parties.operator
+      positionId = "POS-001"
+      requiredMargin = 800000.0
+      vaultId = "VAULT-A-001"
+      verificationStatus = Pending
+      lastChecked = None
+
+  return ()

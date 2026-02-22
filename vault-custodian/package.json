@@ -1,0 +1,16 @@
+{
+  "name": "privamargin-vault-custodian",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for vault custodian operations — auto-accepts transfer offers and processes withdrawals",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241127.0",
+    "typescript": "^5.0.0",
+    "wrangler": "^3.0.0"
+  }
+}

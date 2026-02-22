@@ -1,0 +1,121 @@
+module CollateralVault where
+
+import Assets
+import DA.List (foldl)
+import DA.Optional (fromOptional)
+
+data AssetPosition = AssetPosition
+  with
+    assetId: Text
+    assetType: AssetType
+    amount: Decimal
+    valueUSD: Decimal
+  deriving (Eq, Show)
+
+template CollateralVault
+  with
+    owner: Party
+    operator: Party
+    vaultId: Text
+    collateralAssets: [AssetPosition]
+    linkedPositions: [Text]
+    -- Real deposit tracking (appended for upgrade compatibility)
+    chainVaults: Optional [(Text, Text)]      -- [(chain, custodyAddress)]
+    depositRecords: Optional [(Text, Text, Text, Text)]  -- [(txId, chain, symbol, amount)]
+  where
+    signatory owner, operator
+
+    choice DepositAsset: ContractId CollateralVault
+      with
+        assetCid: ContractId TokenizedAsset
+      controller owner
+      do
+        asset <- fetch assetCid
+        archive assetCid
+        let newPosition = AssetPosition with
+              assetId = asset.assetId
+              assetType = asset.assetType
+              amount = asset.amount
+              valueUSD = asset.valueUSD
+        create this with collateralAssets = newPosition :: collateralAssets
+
+    choice DepositAssetWithTx: ContractId CollateralVault
+      with
+        assetCid: ContractId TokenizedAsset
+        txId: Optional Text
+        chain: Optional Text
+      controller owner
+      do
+        asset <- fetch assetCid
+        archive assetCid
+        let newPosition = AssetPosition with
+              assetId = asset.assetId
+              assetType = asset.assetType
+              amount = asset.amount
+              valueUSD = asset.valueUSD
+        let existingRecords = fromOptional [] depositRecords
+        let updatedRecords = case (txId, chain) of
+              (Some t, Some c) -> (t, c, show asset.assetType, show asset.amount) :: existingRecords
+              _ -> existingRecords
+        create this with
+          collateralAssets = newPosition :: collateralAssets
+          depositRecords = Some updatedRecords
+
+    choice WithdrawAsset: (ContractId CollateralVault, ContractId TokenizedAsset)
+      with
+        assetId: Text
+        issuer: Party
+      controller owner
+      do
+        let (toWithdraw, remaining) = partition (\p -> p.assetId == assetId) collateralAssets
+        case toWithdraw of
+          [pos] -> do
+            assetCid <- create TokenizedAsset with
+              issuer
+              owner
+              assetId = pos.assetId
+              assetType = pos.assetType
+              amount = pos.amount
+              valueUSD = pos.valueUSD
+            vaultCid <- create this with collateralAssets = remaining
+            return (vaultCid, assetCid)
+          _ -> error "Asset not found in vault"
+
+    choice LinkToPosition: ContractId CollateralVault
+      with
+        positionId: Text
+      controller owner
+      do
+        create this with linkedPositions = positionId :: linkedPositions
+
+    choice RegisterChainVault: ContractId CollateralVault
+      with
+        chain: Text
+        custodyAddress: Text
+      controller owner
+      do
+        let existing = fromOptional [] chainVaults
+        create this with chainVaults = Some ((chain, custodyAddress) :: existing)
+
+    choice RecordDeposit: ContractId CollateralVault
+      with
+        depositTxId: Text
+        depositChain: Text
+        depositSymbol: Text
+        depositAmount: Text
+      controller owner
+      do
+        let existing = fromOptional [] depositRecords
+        create this with depositRecords = Some ((depositTxId, depositChain, depositSymbol, depositAmount) :: existing)
+
+    nonconsuming choice GetVaultValue: Decimal
+      controller owner
+      do
+        let totalValue = foldl (\acc pos -> acc + pos.valueUSD) 0.0 collateralAssets
+        return totalValue
+
+    nonconsuming choice GetVaultInfo: (Decimal, Int)
+      controller owner, operator
+      do
+        let totalValue = foldl (\acc pos -> acc + pos.valueUSD) 0.0 collateralAssets
+        return (totalValue, length collateralAssets)

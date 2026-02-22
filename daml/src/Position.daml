@@ -1,0 +1,69 @@
+module Position where
+
+data PositionStatus = Open | MarginCalled | Liquidated | Closed
+  deriving (Eq, Show)
+
+data PositionDirection = Long | Short
+  deriving (Eq, Show)
+
+template Position
+  with
+    fund: Party
+    broker: Party
+    operator: Party
+    positionId: Text
+    vaultId: Text
+    description: Text
+    notionalValue: Decimal
+    collateralValue: Decimal
+    currentLTV: Decimal
+    status: PositionStatus
+    createdAt: Text
+    lastChecked: Text
+    -- New fields appended at end for upgrade compatibility
+    direction: Optional PositionDirection
+    entryPrice: Optional Decimal
+    units: Optional Decimal
+    unrealizedPnL: Optional Decimal
+  where
+    signatory fund, operator
+    observer broker
+
+    choice UpdateLTV: ContractId Position
+      with
+        newCollateralValue: Decimal
+        newLTV: Decimal
+        checkedAt: Text
+        newPnL: Optional Decimal
+      controller operator
+      do
+        create this with
+          collateralValue = newCollateralValue
+          currentLTV = newLTV
+          unrealizedPnL = newPnL
+          lastChecked = checkedAt
+
+    choice MarkMarginCalled: ContractId Position
+      controller operator
+      do
+        create this with status = MarginCalled
+
+    choice ClosePosition: ContractId Position
+      controller fund
+      do
+        create this with status = Closed
+
+    choice LiquidatePosition: ContractId Position
+      with
+        ltvThreshold: Decimal
+        liquidatedAmount: Decimal
+        liquidatedAt: Text
+      controller operator
+      do
+        assertMsg "LTV below threshold, cannot liquidate"
+          (currentLTV >= ltvThreshold)
+        assertMsg "Position not in liquidatable state"
+          (status == Open || status == MarginCalled)
+        create this with
+          status = Liquidated
+          lastChecked = liquidatedAt

@@ -1,0 +1,17 @@
+name = "stratos-privamargin"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# For Cloudflare Pages
+pages_build_output_dir = "./dist"
+
+# KV namespace for storing platform config (operator party, etc.)
+[[kv_namespaces]]
+binding = "PRIVAMARGIN_CONFIG"
+id = "7c64523d0f71497183bd9a20295df71a"
+
+[vars]
+# Canton package ID (update after building DAR with: npm run build:dar)
+PACKAGE_ID = "4a9840c0f6177ff757bdfc1d1c7f90cc2f7510d34d7c974d03c28d2f8eb18f30"
+# CoinMarketCap API key for live prices
+COINMARKETCAP_API_KEY = "441479ed834c4782a04e48d0cb2c2160"

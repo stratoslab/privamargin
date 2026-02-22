@@ -1,0 +1,122 @@
+module BrokerFundLink where
+
+data InvitationStatus = Pending | Accepted | Rejected
+  deriving (Eq, Show)
+
+template BrokerFundInvitation
+  with
+    broker: Party
+    fund: Party
+    operator: Party
+    invitationId: Text
+    createdAt: Text
+    status: InvitationStatus
+  where
+    signatory broker, operator
+    observer fund
+
+    choice AcceptInvitation: ContractId BrokerFundLink
+      controller fund
+      do
+        create BrokerFundLink with
+          broker
+          fund
+          operator
+          linkId = invitationId <> "-link"
+          ltvThreshold = 0.8
+          isActive = True
+          linkedAt = createdAt
+          allowedAssets = Some ["BTC", "ETH", "SOL", "CC", "USDC", "USDT", "TRX", "TON", "CUSD"]
+          allowedCollaterals = Some ["BTC", "ETH", "SOL", "CC", "USDC", "USDT", "TRX", "TON", "CUSD"]
+
+    choice RejectInvitation: ()
+      controller fund
+      do
+        return ()
+
+template BrokerFundLink
+  with
+    broker: Party
+    fund: Party
+    operator: Party
+    linkId: Text
+    ltvThreshold: Decimal
+    isActive: Bool
+    linkedAt: Text
+    allowedAssets: Optional [Text]
+    allowedCollaterals: Optional [Text]
+  where
+    signatory broker, fund, operator
+
+    choice SetLTVThreshold: ContractId BrokerFundLink
+      with
+        newThreshold: Decimal
+      controller broker
+      do
+        create this with ltvThreshold = newThreshold
+
+    choice DeactivateLink: ContractId BrokerFundLink
+      controller broker
+      do
+        create this with isActive = False
+
+    choice UpdateAllowedAssets: ContractId BrokerFundLink
+      with
+        newAllowedAssets: [Text]
+      controller broker
+      do
+        create this with allowedAssets = Some newAllowedAssets
+
+    choice UpdateAllowedCollaterals: ContractId BrokerFundLink
+      with
+        newAllowedCollaterals: [Text]
+      controller broker
+      do
+        create this with allowedCollaterals = Some newAllowedCollaterals
+
+    nonconsuming choice GetLTVThreshold: Decimal
+      controller fund
+      do
+        return ltvThreshold
+
+    nonconsuming choice ProposeLTVChange: ContractId LTVChangeProposal
+      with
+        proposedThreshold: Decimal
+        proposalId: Text
+        proposalCreatedAt: Text
+      controller broker
+      do
+        create LTVChangeProposal with
+          broker
+          fund
+          operator
+          linkContractId = self
+          proposedThreshold
+          currentThreshold = ltvThreshold
+          proposalId
+          createdAt = proposalCreatedAt
+
+template LTVChangeProposal
+  with
+    broker: Party
+    fund: Party
+    operator: Party
+    linkContractId: ContractId BrokerFundLink
+    proposedThreshold: Decimal
+    currentThreshold: Decimal
+    proposalId: Text
+    createdAt: Text
+  where
+    signatory broker, operator
+    observer fund
+
+    choice AcceptProposal: ContractId BrokerFundLink
+      controller fund
+      do
+        exercise linkContractId SetLTVThreshold with newThreshold = proposedThreshold
+
+    choice RejectProposal: ()
+      controller fund
+      do
+        exercise linkContractId DeactivateLink
+        return ()

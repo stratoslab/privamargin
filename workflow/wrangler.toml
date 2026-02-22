@@ -1,0 +1,22 @@
+name = "privamargin-ltv-monitor"
+account_id = "325f8b322c30ee0f5460cfdaef82ecf5"
+main = "ltv-monitor.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[workflows]]
+name = "ltv-monitor-workflow"
+binding = "LTV_MONITOR_WORKFLOW"
+class_name = "LTVMonitorWorkflow"
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[vars]
+CANTON_HOST = "p2-json.cantondefi.com"
+PACKAGE_ID = "4a9840c0f6177ff757bdfc1d1c7f90cc2f7510d34d7c974d03c28d2f8eb18f30"
+COINMARKETCAP_API_KEY = "441479ed834c4782a04e48d0cb2c2160"
+
+# Secrets (set via `wrangler secret put`):
+# - CANTON_AUTH_TOKEN
+# - OPERATOR_PARTY

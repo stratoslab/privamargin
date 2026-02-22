@@ -1,0 +1,128 @@
+module MarginVerification where
+
+import CollateralVault
+
+data VerificationStatus = Pending | Sufficient | Insufficient
+  deriving (Eq, Show)
+
+template MarginRequirement
+  with
+    provider: Party
+    counterparty: Party
+    operator: Party
+    positionId: Text
+    requiredMargin: Decimal
+    vaultId: Text
+    verificationStatus: VerificationStatus
+    lastChecked: Optional Time
+  where
+    signatory provider, counterparty, operator
+    observer provider, counterparty
+
+    choice VerifyMargin: ContractId MarginRequirement
+      with
+        vaultCid: ContractId CollateralVault
+        currentTime: Time
+      controller operator
+      do
+        (collateralValue, _) <- exercise vaultCid GetVaultInfo
+        let status = if collateralValue >= requiredMargin 
+                     then Sufficient 
+                     else Insufficient
+        create this with 
+          verificationStatus = status
+          lastChecked = Some currentTime
+
+    choice TriggerMarginCall: ContractId MarginCall
+      controller counterparty
+      do
+        assertMsg "Margin must be insufficient" (verificationStatus == Insufficient)
+        create MarginCall with
+          provider
+          counterparty
+          operator
+          positionId
+          requiredAmount = requiredMargin
+          callTime = None
+          status = Active
+
+data MarginCallStatus = Active | Settled | Cancelled
+  deriving (Eq, Show)
+
+template MarginCall
+  with
+    provider: Party
+    counterparty: Party
+    operator: Party
+    positionId: Text
+    requiredAmount: Decimal
+    callTime: Optional Time
+    status: MarginCallStatus
+  where
+    signatory provider, counterparty, operator
+
+    choice SettleMarginCall: ContractId Settlement
+      with
+        vaultCid: ContractId CollateralVault
+        settledAssets: [AssetPosition]
+        settlementTime: Time
+      controller operator
+      do
+        archive vaultCid
+        create Settlement with
+          provider
+          counterparty
+          positionId
+          settledAmount = requiredAmount
+          settledAssets
+          settlementTime
+
+    choice CancelMarginCall: ()
+      controller provider, counterparty
+      do
+        return ()
+
+template Settlement
+  with
+    provider: Party
+    counterparty: Party
+    positionId: Text
+    settledAmount: Decimal
+    settledAssets: [AssetPosition]
+    settlementTime: Time
+  where
+    signatory provider, counterparty
+
+data WorkflowMarginCallStatus = WMCActive | WMCAcknowledged | WMCResolved | WMCCancelled
+  deriving (Eq, Show)
+
+template WorkflowMarginCall
+  with
+    operator: Party
+    fund: Party
+    broker: Party
+    positionId: Text
+    vaultId: Text
+    requiredAmount: Decimal
+    currentLTV: Decimal
+    ltvThreshold: Decimal
+    callTime: Text
+    status: WorkflowMarginCallStatus
+  where
+    signatory operator
+    observer fund, broker
+
+    choice AcknowledgeMarginCall: ContractId WorkflowMarginCall
+      controller fund
+      do
+        create this with status = WMCAcknowledged
+
+    choice ResolveMarginCall: ContractId WorkflowMarginCall
+      controller operator
+      do
+        create this with status = WMCResolved
+
+    choice CancelWorkflowMarginCall: ()
+      controller operator
+      do
+        return ()

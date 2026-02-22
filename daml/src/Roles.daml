@@ -1,0 +1,68 @@
+module Roles where
+
+data Role = Fund | PrimeBroker
+  deriving (Eq, Show)
+
+-- Operator creates this to grant a party the PrimeBroker role
+template OperatorRole
+  with
+    operator: Party
+  where
+    signatory operator
+
+    nonconsuming choice AssignPrimeBroker: ContractId RoleAssignment
+      with
+        broker: Party
+      controller operator
+      do
+        create RoleAssignment with
+          party = broker
+          role = PrimeBroker
+          assignedBy = operator
+          operator
+
+    nonconsuming choice AssignFund: ContractId RoleAssignment
+      with
+        fund: Party
+      controller operator
+      do
+        create RoleAssignment with
+          party = fund
+          role = Fund
+          assignedBy = operator
+          operator
+
+-- Prime broker can assign fund roles to parties
+template BrokerRole
+  with
+    broker: Party
+    operator: Party
+  where
+    signatory operator, broker
+
+    nonconsuming choice BrokerAssignFund: ContractId RoleAssignment
+      with
+        fund: Party
+      controller broker
+      do
+        create RoleAssignment with
+          party = fund
+          role = Fund
+          assignedBy = broker
+          operator
+
+-- Persistent record of a party's role assignment
+template RoleAssignment
+  with
+    party: Party
+    role: Role
+    assignedBy: Party
+    operator: Party
+  where
+    signatory operator
+    observer party
+
+    choice RevokeRole: ()
+      controller operator
+      do
+        return ()

@@ -1,0 +1,37 @@
+{
+  "name": "stratos-privamargin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run copy-dar && tsc -b && vite build",
+    "build:dar": "cd daml && daml build && cd .. && npm run update-package-id && npm run copy-dar",
+    "copy-dar": "mkdir -p public && DAR=$(ls -t daml/.daml/dist/*.dar 2>/dev/null | head -1) && [ -n \"$DAR\" ] && cp \"$DAR\" public/package.dar || echo 'No DAR file found'",
+    "update-package-id": "PKGID=$(daml damlc inspect daml/.daml/dist/*.dar 2>/dev/null | head -1 | awk '{print $2}') && sed -i \"s/^PACKAGE_ID = .*/PACKAGE_ID = \\\"$PKGID\\\"/\" wrangler.toml && echo \"Updated PACKAGE_ID to $PKGID\"",
+    "preview": "vite preview",
+    "deploy": "npm run build && wrangler pages deploy dist",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.11.1",
+    "@emotion/styled": "^11.11.0",
+    "@mui/icons-material": "^5.14.19",
+    "@mui/material": "^5.14.20",
+    "@stratos-wallet/sdk": "file:../stratos-wallet-sdk",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^6.20.1",
+    "recharts": "^2.10.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240117.0",
+    "@types/react": "^19.1.6",
+    "@types/react-dom": "^19.1.5",
+    "@vitejs/plugin-react": "^4.5.1",
+    "solc": "^0.8.34",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.0",
+    "wrangler": "^3.99.0"
+  }
+}

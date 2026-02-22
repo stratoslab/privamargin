@@ -1,0 +1,52 @@
+module Assets where
+
+data AssetType = CantonCoin | Stablecoin | Cryptocurrency | RWA | Bond | Equity
+  deriving (Eq, Show)
+
+template TokenizedAsset
+  with
+    issuer: Party
+    owner: Party
+    assetId: Text
+    assetType: AssetType
+    amount: Decimal
+    valueUSD: Decimal
+  where
+    signatory issuer, owner
+
+    choice Transfer: ContractId TokenizedAsset
+      with
+        newOwner: Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+    choice UpdateValue: ContractId TokenizedAsset
+      with
+        newValueUSD: Decimal
+      controller issuer
+      do
+        create this with valueUSD = newValueUSD
+
+template AssetIssuance
+  with
+    issuer: Party
+    recipient: Party
+    assetId: Text
+    assetType: AssetType
+    amount: Decimal
+    valueUSD: Decimal
+  where
+    signatory issuer
+    observer recipient
+
+    choice Accept: ContractId TokenizedAsset
+      controller recipient
+      do
+        create TokenizedAsset with
+          issuer
+          owner = recipient
+          assetId
+          assetType
+          amount
+          valueUSD

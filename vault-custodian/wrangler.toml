@@ -1,0 +1,18 @@
+name = "privamargin-vault-custodian"
+account_id = "325f8b322c30ee0f5460cfdaef82ecf5"
+main = "custodian-worker.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+CANTON_HOST = "p2-json.cantondefi.com"
+SPLICE_VALIDATOR_HOST = "p2-validator.cantondefi.com"
+PACKAGE_ID = "4a9840c0f6177ff757bdfc1d1c7f90cc2f7510d34d7c974d03c28d2f8eb18f30"
+
+# Secrets (set via `wrangler secret put`):
+# - CANTON_AUTH_SECRET  — JWT signing secret for Canton JSON API
+# - CUSTODIAN_PARTY     — the provisioned custodian party ID
+# - CUSTODIAN_USER      — the Canton user ID for the custodian (e.g., "vault-custodian")
