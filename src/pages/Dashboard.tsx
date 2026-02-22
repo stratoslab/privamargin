@@ -758,11 +758,11 @@ function RelayPanel() {
     try {
       const sdk = getSDK();
       const addresses = await sdk.getAddresses();
-      // Filter EVM addresses and map chain names to chain IDs
+      // Filter EVM-compatible addresses (evm + base) and map chain names to chain IDs
       const evmChains: Array<{ chainId: number; name: string; address: string }> = [];
       const seenChainIds = new Set<number>();
       for (const addr of addresses) {
-        if (addr.chainType === 'evm') {
+        if (addr.chainType === 'evm' || addr.chainType === 'base') {
           const chainId = CHAIN_NAME_TO_ID[addr.chain];
           if (chainId && !seenChainIds.has(chainId) && CHAIN_CONFIG[chainId]) {
             seenChainIds.add(chainId);
