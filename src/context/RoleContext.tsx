@@ -12,7 +12,7 @@ interface RoleContextType {
   isOperator: boolean;
   hasOperator: boolean;
   loading: boolean;
-  assignRole: (partyId: string, role: 'fund' | 'primebroker') => Promise<void>;
+  assignRole: (partyId: string, role: 'fund' | 'primebroker' | 'operator') => Promise<void>;
   removeRole: (partyId: string) => Promise<void>;
   becomeOperator: () => Promise<void>;
   allRoles: Record<string, string>;
@@ -94,7 +94,13 @@ export function RoleProvider({ user, children }: { user: AuthUser | null; childr
       const configRes = await fetch('/api/config');
       const configData = await configRes.json() as { operatorParty?: string };
       setHasOperator(!!configData.operatorParty);
-      setIsOperator(configData.operatorParty === partyId);
+      // Primary operator (from config) OR additional operator (from roles KV)
+      const isPrimaryOperator = configData.operatorParty === partyId;
+      const allRes2 = await fetch('/api/roles');
+      const allData2 = await allRes2.json() as { roles?: Record<string, string> };
+      const kvRoles = allData2.roles || {};
+      const isAdditionalOperator = kvRoles[partyId] === 'operator';
+      setIsOperator(isPrimaryOperator || isAdditionalOperator);
     } catch (err) {
       console.error('Failed to fetch roles:', err);
     } finally {
@@ -122,35 +128,38 @@ export function RoleProvider({ user, children }: { user: AuthUser | null; childr
     await refreshRoles();
   }, [partyId, refreshRoles]);
 
-  const assignRole = useCallback(async (targetPartyId: string, newRole: 'fund' | 'primebroker') => {
-    // Try Canton ledger first
-    try {
-      if (newRole === 'primebroker') {
-        // Operator assigns primebroker
-        const operatorRole = await roleAPI.getOperatorRole(partyId);
-        if (operatorRole.data.contractId) {
-          await roleAPI.assignPrimeBroker(operatorRole.data.contractId, targetPartyId);
-          // Also create BrokerRole contract for the new broker
-          await roleAPI.createBrokerRole(targetPartyId, partyId);
-        }
-      } else if (newRole === 'fund') {
-        // Check if current user is a broker with a BrokerRole contract
-        const brokerRole = await roleAPI.getBrokerRole(partyId);
-        if (brokerRole.data.contractId) {
-          await roleAPI.brokerAssignFund(brokerRole.data.contractId, targetPartyId);
-        } else {
-          // Operator assigning fund directly
+  const assignRole = useCallback(async (targetPartyId: string, newRole: 'fund' | 'primebroker' | 'operator') => {
+    // Operator role is KV-only (no Canton contract for additional operators)
+    if (newRole !== 'operator') {
+      // Try Canton ledger first
+      try {
+        if (newRole === 'primebroker') {
+          // Operator assigns primebroker
           const operatorRole = await roleAPI.getOperatorRole(partyId);
           if (operatorRole.data.contractId) {
-            await roleAPI.assignFund(operatorRole.data.contractId, targetPartyId);
+            await roleAPI.assignPrimeBroker(operatorRole.data.contractId, targetPartyId);
+            // Also create BrokerRole contract for the new broker
+            await roleAPI.createBrokerRole(targetPartyId, partyId);
+          }
+        } else if (newRole === 'fund') {
+          // Check if current user is a broker with a BrokerRole contract
+          const brokerRole = await roleAPI.getBrokerRole(partyId);
+          if (brokerRole.data.contractId) {
+            await roleAPI.brokerAssignFund(brokerRole.data.contractId, targetPartyId);
+          } else {
+            // Operator assigning fund directly
+            const operatorRole = await roleAPI.getOperatorRole(partyId);
+            if (operatorRole.data.contractId) {
+              await roleAPI.assignFund(operatorRole.data.contractId, targetPartyId);
+            }
           }
         }
+      } catch (err) {
+        console.warn('Canton role assignment failed, falling back to KV:', err);
       }
-    } catch (err) {
-      console.warn('Canton role assignment failed, falling back to KV:', err);
     }
 
-    // Also persist to KV as fallback
+    // Persist to KV
     await fetch('/api/roles', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

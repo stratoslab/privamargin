@@ -51,23 +51,29 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
       );
     }
 
-    if (body.role !== 'fund' && body.role !== 'primebroker') {
+    if (body.role !== 'fund' && body.role !== 'primebroker' && body.role !== 'operator') {
       return new Response(
-        JSON.stringify({ success: false, error: 'role must be "fund" or "primebroker"' }),
+        JSON.stringify({ success: false, error: 'role must be "fund", "primebroker", or "operator"' }),
         { status: 400, headers: CORS_HEADERS }
       );
     }
 
-    // Authorization: operator can assign primebroker, primebroker can assign fund
+    // Authorization: operator can assign operator/primebroker, primebroker can assign fund
     const operatorParty = await env.PRIVAMARGIN_CONFIG.get('operatorParty');
     const rolesRaw = await env.PRIVAMARGIN_CONFIG.get('roles');
     const roles: Record<string, string> = rolesRaw ? JSON.parse(rolesRaw) : {};
 
     if (body.requestingParty) {
-      const isOperator = body.requestingParty === operatorParty;
+      const isOperator = body.requestingParty === operatorParty || roles[body.requestingParty] === 'operator';
       const requesterRole = roles[body.requestingParty];
       const isBroker = requesterRole === 'primebroker';
 
+      if (body.role === 'operator' && !isOperator) {
+        return new Response(
+          JSON.stringify({ success: false, error: 'Only an operator can assign operator roles' }),
+          { status: 403, headers: CORS_HEADERS }
+        );
+      }
       if (body.role === 'primebroker' && !isOperator) {
         return new Response(
           JSON.stringify({ success: false, error: 'Only the operator can assign prime broker roles' }),
@@ -114,7 +120,7 @@ export const onRequestDelete: PagesFunction<Env> = async ({ request, env }) => {
     const currentRoles: Record<string, string> = rolesRaw2 ? JSON.parse(rolesRaw2) : {};
 
     if (body.requestingParty) {
-      const isOperator = body.requestingParty === operatorParty;
+      const isOperator = body.requestingParty === operatorParty || currentRoles[body.requestingParty] === 'operator';
       const requesterRole = currentRoles[body.requestingParty];
       const isBroker = requesterRole === 'primebroker';
       const targetRole = currentRoles[body.partyId];

@@ -297,7 +297,7 @@ function SidebarLayout({ children, user }: { children: React.ReactNode; user: Au
 function OperatorSetup({ user }: { user: AuthUser }) {
   const { assignRole, removeRole, allRoles, refreshRoles, role: ownRole } = useRole();
   const [newPartyId, setNewPartyId] = useState('');
-  const [newRole, setNewRole] = useState<'fund' | 'primebroker'>('primebroker');
+  const [newRole, setNewRole] = useState<'fund' | 'primebroker' | 'operator'>('primebroker');
 
   // Platform asset management (operator only)
   const [platformAssets, setPlatformAssets] = useState<Array<{ type: string; name: string; category: string }>>([]);
@@ -352,8 +352,9 @@ function OperatorSetup({ user }: { user: AuthUser }) {
 
   // Determine what roles this user can assign
   const canAssignBroker = !ownRole; // operator (no role) can assign brokers
-  const availableRoles: Array<{ value: 'fund' | 'primebroker'; label: string }> = [];
+  const availableRoles: Array<{ value: 'fund' | 'primebroker' | 'operator'; label: string }> = [];
   if (canAssignBroker) {
+    availableRoles.push({ value: 'operator', label: 'Operator' });
     availableRoles.push({ value: 'primebroker', label: 'Primebroker' });
   }
   availableRoles.push({ value: 'fund', label: 'Fund' });
@@ -423,7 +424,7 @@ function OperatorSetup({ user }: { user: AuthUser }) {
             <Select
               value={newRole}
               label="Role"
-              onChange={(e) => setNewRole(e.target.value as 'fund' | 'primebroker')}
+              onChange={(e) => setNewRole(e.target.value as 'fund' | 'primebroker' | 'operator')}
               sx={{
                 color: 'white',
                 '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,255,255,0.1)' },
@@ -491,11 +492,11 @@ function OperatorSetup({ user }: { user: AuthUser }) {
                     {pid.split('::')[0]}
                   </Typography>
                   <Chip
-                    label={r === 'primebroker' ? 'Primebroker' : 'Fund'}
+                    label={r === 'operator' ? 'Operator' : r === 'primebroker' ? 'Primebroker' : 'Fund'}
                     size="small"
                     sx={{
-                      bgcolor: r === 'primebroker' ? 'rgba(139,92,246,0.2)' : 'rgba(0,212,170,0.2)',
-                      color: r === 'primebroker' ? '#8b5cf6' : '#00d4aa',
+                      bgcolor: r === 'operator' ? 'rgba(245,158,11,0.2)' : r === 'primebroker' ? 'rgba(139,92,246,0.2)' : 'rgba(0,212,170,0.2)',
+                      color: r === 'operator' ? '#f59e0b' : r === 'primebroker' ? '#8b5cf6' : '#00d4aa',
                       fontWeight: 600,
                       fontSize: 11,
                     }}
@@ -844,10 +845,15 @@ function RoleGate({ user, assets }: { user: AuthUser; assets: Asset[] }) {
     return <BecomeOperator user={user} />;
   }
 
+  // Operator gets the full app (Dashboard with Relay/Custodian panels + admin route)
+  if (isOperator) {
+    return <AppRoutes user={user} assets={assets} />;
+  }
+
   // No role assigned yet
   if (!role) {
-    // Operator or primebroker can manage roles
-    if (isOperator || isPrimeBroker) {
+    // Primebroker can manage roles
+    if (isPrimeBroker) {
       return <OperatorSetup user={user} />;
     }
     // Non-operator, non-broker without a role: awaiting assignment
