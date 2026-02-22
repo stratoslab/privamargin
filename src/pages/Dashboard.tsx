@@ -803,8 +803,10 @@ function RelayPanel() {
       const result = await vaultAPI.deployDepositRelay(chainId, chain?.address);
       setRelayAddresses(prev => ({ ...prev, [chainId]: result.data.contractAddress }));
       setSuccess(`Relay deployed on ${CHAIN_ID_TO_NAME[chainId] || chainId}: ${result.data.contractAddress.slice(0, 16)}...`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Deploy failed');
+    } catch (err: unknown) {
+      console.error('[RelayPanel] Deploy failed:', err);
+      const msg = err instanceof Error ? err.message : typeof err === 'object' && err !== null ? JSON.stringify(err) : 'Deploy failed';
+      setError(msg);
     }
     setDeploying(null);
   };
