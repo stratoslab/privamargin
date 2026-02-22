@@ -4,8 +4,9 @@ import { Add, Visibility, VisibilityOff, Lock, LockOpen, TrendingUp, Warning, Sh
 import { useNavigate } from 'react-router-dom';
 import { vaultAPI, marginAPI, invitationAPI, positionAPI, linkAPI, workflowMarginCallAPI, getCustodianParty } from '../services/api';
 import type { PositionData, BrokerFundLinkData, WorkflowMarginCallData } from '../services/api';
-import { CHAIN_CONFIG, CHAIN_ID_TO_NAME, getAvailableChainIds } from '../services/evmEscrow';
+import { CHAIN_CONFIG, CHAIN_NAME_TO_ID, CHAIN_ID_TO_NAME } from '../services/evmEscrow';
 import { useRole } from '../context/RoleContext';
+import { getSDK } from '@stratos-wallet/sdk';
 import type { AuthUser, Asset } from '@stratos-wallet/sdk';
 
 interface DashboardProps {
@@ -740,19 +741,49 @@ function CustodianPanel() {
 
 // Deposit Relay Panel — shown on operator dashboard for per-chain relay deployment
 function RelayPanel() {
-  const availableChains = getAvailableChainIds();
   const [deploying, setDeploying] = useState<number | null>(null);
   const [error, setError] = useState<string>('');
   const [success, setSuccess] = useState<string>('');
-  // Force re-render after deploy by tracking deployed addresses
-  const [relayAddresses, setRelayAddresses] = useState<Record<number, string>>(() => {
-    const addrs: Record<number, string> = {};
-    for (const chainId of availableChains) {
-      const cfg = CHAIN_CONFIG[chainId];
-      if (cfg?.relay) addrs[chainId] = cfg.relay;
+  // EVM chains detected from wallet SDK
+  const [walletChains, setWalletChains] = useState<Array<{ chainId: number; name: string; address: string }>>([]);
+  const [walletsLoading, setWalletsLoading] = useState(true);
+  // Track deployed relay addresses
+  const [relayAddresses, setRelayAddresses] = useState<Record<number, string>>({});
+
+  useEffect(() => {
+    detectEVMChains();
+  }, []);
+
+  const detectEVMChains = async () => {
+    try {
+      const sdk = getSDK();
+      const addresses = await sdk.getAddresses();
+      // Filter EVM addresses and map chain names to chain IDs
+      const evmChains: Array<{ chainId: number; name: string; address: string }> = [];
+      const seenChainIds = new Set<number>();
+      for (const addr of addresses) {
+        if (addr.chainType === 'evm') {
+          const chainId = CHAIN_NAME_TO_ID[addr.chain];
+          if (chainId && !seenChainIds.has(chainId) && CHAIN_CONFIG[chainId]) {
+            seenChainIds.add(chainId);
+            evmChains.push({ chainId, name: addr.chain, address: addr.address });
+          }
+        }
+      }
+      setWalletChains(evmChains);
+
+      // Load existing relay addresses for detected chains
+      const addrs: Record<number, string> = {};
+      for (const c of evmChains) {
+        const cfg = CHAIN_CONFIG[c.chainId];
+        if (cfg?.relay) addrs[c.chainId] = cfg.relay;
+      }
+      setRelayAddresses(addrs);
+    } catch (err) {
+      console.warn('Failed to detect EVM chains from wallet:', err);
     }
-    return addrs;
-  });
+    setWalletsLoading(false);
+  };
 
   const handleDeploy = async (chainId: number) => {
     setDeploying(chainId);
@@ -768,7 +799,8 @@ function RelayPanel() {
     setDeploying(null);
   };
 
-  const allDeployed = availableChains.every(id => relayAddresses[id]);
+  const availableChains = walletChains.map(c => c.chainId);
+  const allDeployed = availableChains.length > 0 && availableChains.every(id => relayAddresses[id]);
 
   return (
     <Box
@@ -798,9 +830,13 @@ function RelayPanel() {
         <Box sx={{ flex: 1 }}>
           <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'white' }}>Deposit Relay</Typography>
           <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>
-            {allDeployed
+            {walletsLoading
+              ? 'Detecting EVM wallets...'
+              : walletChains.length === 0
+              ? 'No EVM wallets detected — add an Ethereum wallet in the portal'
+              : allDeployed
               ? 'Privacy pool active on all chains — deposits are routed through relay'
-              : 'Deploy relay contracts to enable privacy-preserving deposits'}
+              : `${walletChains.length} EVM chain${walletChains.length > 1 ? 's' : ''} detected — deploy relay contracts for privacy`}
           </Typography>
         </Box>
       </Box>
