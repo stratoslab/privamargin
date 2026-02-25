@@ -66,7 +66,7 @@ setupDemo = do
   assetCid2 <- submit parties.institutionA $ exerciseCmd asset2 Accept
 
   -- Create vault for Institution A
-  vault <- submitMulti [parties.institutionA, parties.operator] [] $ createCmd CollateralVault with
+  vault <- submit parties.institutionA $ createCmd CollateralVault with
     owner = parties.institutionA
     operator = parties.operator
     vaultId = "VAULT-A-001"

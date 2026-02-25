@@ -12,6 +12,27 @@ id = "7c64523d0f71497183bd9a20295df71a"
 
 [vars]
 # Canton package ID (update after building DAR with: npm run build:dar)
-PACKAGE_ID = "4a9840c0f6177ff757bdfc1d1c7f90cc2f7510d34d7c974d03c28d2f8eb18f30"
+PACKAGE_ID = "4b60e70f9f90e2164c86529fe91dbacf858a0b0de2498a5366e33120691d09a6"
 # CoinMarketCap API key for live prices
 COINMARKETCAP_API_KEY = "441479ed834c4782a04e48d0cb2c2160"
+# RPC endpoints for escrow deployer (public RPCs, replace with private for production)
+RPC_SEPOLIA = "https://ethereum-sepolia-rpc.publicnode.com"
+RPC_BASE_SEPOLIA = "https://base-sepolia-rpc.publicnode.com"
+RPC_ETHEREUM = "https://ethereum-rpc.publicnode.com"
+RPC_BASE = "https://base-rpc.publicnode.com"
+
+# Splice validator connection (for custodian CC transfers)
+SPLICE_HOST = "p1.cantondefi.com"
+SPLICE_PORT = "443"
+CANTON_AUTH_SECRET = "unsafe"
+CANTON_AUTH_AUDIENCE = "https://canton.network.global"
+CUSTODIAN_USER = "vault-custodian"
+
+# Canton JSON API v2 connection (for USDCHolding Split/Transfer)
+CANTON_JSON_HOST = "p1-json.cantondefi.com"
+SPLICE_ADMIN_USER = "app-user"
+USDC_TEMPLATE_ID = "3b6cd0197bc2cd409db5f689f0ee07638cb0a73307196f729280c6924a431c9e:CantonUSDC.Token:USDCHolding"
+
+# Secrets (set via `wrangler pages secret put`):
+# - DEPLOYER_PRIVATE_KEY  — hex-encoded private key for the dedicated deployer EOA
+# - API_SECRET            — shared secret for authenticating deploy requests

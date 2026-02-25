@@ -35,11 +35,14 @@ interface PositionContract {
     vaultId: string;
     description: string;
     notionalValue: string;
-    collateralValue: string;
     currentLTV: string;
     status: string;
     createdAt: string;
     lastChecked: string;
+    direction: string | null;
+    entryPrice: string | null;
+    units: string | null;
+    unrealizedPnL: string | null;
   };
 }
 
@@ -172,6 +175,30 @@ function assetTypeToSymbol(assetType: string): string {
   }
 }
 
+// Extract the traded asset symbol from the position description
+// Format: "LONG 10 ETH" or "SHORT 5 BTC" → "ETH" or "BTC"
+function extractAssetSymbol(description: string): string | null {
+  const parts = description.trim().split(/\s+/);
+  // Last word is typically the symbol
+  const symbol = parts[parts.length - 1];
+  return symbol && CMC_IDS[symbol] ? symbol : null;
+}
+
+// Calculate unrealized PnL for a position given current price
+function calculatePnL(
+  direction: string | null,
+  entryPrice: number,
+  units: number,
+  currentPrice: number,
+): number {
+  if (!entryPrice || !units || !currentPrice) return 0;
+  if (direction === 'Short') {
+    return units * (entryPrice - currentPrice);
+  }
+  // Default to Long
+  return units * (currentPrice - entryPrice);
+}
+
 async function fetchLivePrices(apiKey: string): Promise<Record<string, number>> {
   const prices = { ...FALLBACK_PRICES };
 
@@ -275,18 +302,46 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
       return await fetchLivePrices(env.COINMARKETCAP_API_KEY);
     });
 
-    // Step 4: Compute LTVs
+    // Step 4: Compute PnL and LTVs
+    //   PnL: Long = units * (currentPrice - entryPrice), Short = reverse
+    //   LTV: totalNotional / (collateral + totalPnL)
+    //   Multiple positions on one vault share the collateral, so we aggregate.
     const ltvResults = await step.do('compute-ltvs', async () => {
+      // Pre-compute per-position PnL
+      const positionPnLs: Record<string, number> = {};
+      for (const pos of positions) {
+        const entryPrice = parseFloat(pos.payload.entryPrice || '0') || 0;
+        const units = parseFloat(pos.payload.units || '0') || 0;
+        const assetSymbol = extractAssetSymbol(pos.payload.description);
+        const currentPrice = assetSymbol ? (prices[assetSymbol] || 0) : 0;
+        positionPnLs[pos.contractId] = calculatePnL(pos.payload.direction, entryPrice, units, currentPrice);
+      }
+
+      // Aggregate notional + PnL per vault (only open/margin-called positions)
+      const vaultAggregates: Record<string, { totalNotional: number; totalPnL: number }> = {};
+      for (const pos of positions) {
+        const vid = pos.payload.vaultId;
+        if (!vaultAggregates[vid]) vaultAggregates[vid] = { totalNotional: 0, totalPnL: 0 };
+        vaultAggregates[vid].totalNotional += parseFloat(pos.payload.notionalValue) || 0;
+        vaultAggregates[vid].totalPnL += positionPnLs[pos.contractId] || 0;
+      }
+
       return positions.map(pos => {
         const vault = vaults[pos.payload.vaultId];
         const notional = parseFloat(pos.payload.notionalValue) || 0;
         let collateralValue = 0;
-
         if (vault) {
           collateralValue = calculateVaultValue(vault, prices);
         }
 
-        const ltv = collateralValue > 0 ? notional / collateralValue : 0;
+        const pnl = positionPnLs[pos.contractId] || 0;
+        const agg = vaultAggregates[pos.payload.vaultId];
+
+        // Effective collateral = vault collateral + aggregate PnL of all positions on this vault
+        const effectiveCollateral = collateralValue + (agg?.totalPnL || 0);
+        // LTV = aggregate notional / effective collateral (same for all positions on this vault)
+        const totalNotional = agg?.totalNotional || notional;
+        const ltv = effectiveCollateral > 0 ? totalNotional / effectiveCollateral : (totalNotional > 0 ? Infinity : 0);
 
         return {
           contractId: pos.contractId,
@@ -297,7 +352,8 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
           operator: pos.payload.operator,
           notional,
           collateralValue,
-          currentLTV: ltv,
+          pnl,
+          currentLTV: ltv === Infinity ? 999 : ltv,
         };
       });
     });
@@ -375,9 +431,9 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
               POSITION_TEMPLATE,
               'UpdateLTV',
               {
-                newCollateralValue: result.collateralValue.toString(),
                 newLTV: result.currentLTV.toString(),
                 checkedAt: new Date().toISOString(),
+                newPnL: result.pnl.toString(),
               }
             );
           });

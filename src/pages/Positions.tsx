@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react';
 import {
-  Box, Typography, Button, Chip, Grid, TextField,
+  Box, Typography, Button, Chip, TextField,
   Dialog, DialogTitle, DialogContent, DialogActions,
-  Stepper, Step, StepLabel
+  Stepper, Step, StepLabel,
+  Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
 } from '@mui/material';
 import { Add, TrendingUp, Close, ArrowBack, ArrowForward, Warning, Gavel } from '@mui/icons-material';
-import { positionAPI, linkAPI, vaultAPI, getLivePrice } from '../services/api';
-import type { PositionData, BrokerFundLinkData } from '../services/api';
+import { positionAPI, linkAPI, vaultAPI, getLivePrice, displaySymbol } from '../services/api';
+import type { PositionData, BrokerFundLinkData, LiquidationRecord } from '../services/api';
 import { useRole } from '../context/RoleContext';
 import type { AuthUser, Asset } from '@stratos-wallet/sdk';
 
@@ -29,7 +30,335 @@ function getLTVLabel(ltv: number, threshold?: number): string {
   return 'Healthy';
 }
 
+// Status chip styles
+function statusChipSx(status: string) {
+  const isOpen = status === 'Open';
+  const isDanger = status === 'MarginCalled' || status === 'Liquidated';
+  return {
+    bgcolor: isOpen ? 'rgba(0,212,170,0.2)' : isDanger ? 'rgba(239,68,68,0.2)' : 'rgba(255,255,255,0.1)',
+    color: isOpen ? '#00d4aa' : isDanger ? '#ef4444' : 'rgba(255,255,255,0.5)',
+    fontWeight: 600,
+    fontSize: 11,
+  };
+}
+
+// Shared table header cell style
+const thSx = {
+  color: 'rgba(255,255,255,0.5)',
+  fontSize: 11,
+  fontWeight: 600,
+  borderBottom: '1px solid rgba(255,255,255,0.06)',
+  textTransform: 'uppercase' as const,
+  letterSpacing: 0.5,
+  py: 1.5,
+  px: 1.5,
+  whiteSpace: 'nowrap' as const,
+};
+
+// Shared table body cell style
+const tdSx = {
+  color: 'white',
+  fontSize: 13,
+  borderBottom: '1px solid rgba(255,255,255,0.04)',
+  py: 1.5,
+  px: 1.5,
+};
+
 const STEP_LABELS = ['Select Broker', 'Select Asset', 'Enter Units', 'Select Vault', 'Confirm'];
+
+// Detail row helper
+const detailRow = (label: string, value: string, color?: string) => (
+  <Box key={label} sx={{ display: 'flex', justifyContent: 'space-between', py: 0.8, borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+    <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>{label}</Typography>
+    <Typography sx={{ fontSize: 13, fontWeight: 600, color: color || 'white' }}>{value}</Typography>
+  </Box>
+);
+
+function PositionDetailDialog({
+  position,
+  ltvThreshold,
+  onClose,
+}: {
+  position: PositionData | null;
+  ltvThreshold: number;
+  onClose: () => void;
+}) {
+  const [liqRecord, setLiqRecord] = useState<LiquidationRecord | null>(null);
+
+  useEffect(() => {
+    if (position?.status === 'Liquidated') {
+      const record = positionAPI.getLiquidationRecord(position.positionId);
+      setLiqRecord(record || null);
+    } else {
+      setLiqRecord(null);
+    }
+  }, [position]);
+
+  if (!position) return null;
+
+  const ltvColor = getLTVColor(position.currentLTV, ltvThreshold);
+  const pnl = position.unrealizedPnL || 0;
+
+  return (
+    <Dialog
+      open={!!position}
+      onClose={onClose}
+      maxWidth="sm"
+      fullWidth
+      PaperProps={{ sx: { bgcolor: '#111820', color: 'white', maxHeight: '85vh' } }}
+    >
+      <DialogTitle sx={{ pb: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+          <Typography sx={{ fontSize: 18, fontWeight: 600 }}>{position.positionId}</Typography>
+          <Chip
+            label={position.direction || 'Long'}
+            size="small"
+            sx={{
+              bgcolor: position.direction === 'Short' ? 'rgba(239,68,68,0.15)' : 'rgba(0,212,170,0.15)',
+              color: position.direction === 'Short' ? '#ef4444' : '#00d4aa',
+              fontWeight: 700,
+              fontSize: 10,
+              height: 20,
+            }}
+          />
+          <Chip label={position.status} size="small" sx={statusChipSx(position.status)} />
+        </Box>
+        <Button onClick={onClose} sx={{ color: 'rgba(255,255,255,0.4)', minWidth: 'auto' }}>
+          <Close />
+        </Button>
+      </DialogTitle>
+      <DialogContent sx={{ pt: 1 }}>
+        {/* Header info — all statuses */}
+        <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2, mb: 2 }}>
+          {detailRow('Description', position.description || '-')}
+          {detailRow('Vault ID', position.vaultId)}
+          {detailRow('Fund', position.fund.split('::')[0])}
+          {detailRow('Broker', position.broker.split('::')[0])}
+          {detailRow('Created', new Date(position.createdAt).toLocaleString())}
+          {detailRow('Last Checked', new Date(position.lastChecked).toLocaleString())}
+        </Box>
+
+        {/* Open / MarginCalled — active position details */}
+        {(position.status === 'Open' || position.status === 'MarginCalled') && (
+          <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2, mb: 2 }}>
+            <Typography sx={{ fontSize: 14, fontWeight: 600, color: 'white', mb: 1 }}>Position Details</Typography>
+            {detailRow('Notional Value', `$${position.notionalValue.toLocaleString()}`)}
+            {detailRow('Collateral Value', `$${position.collateralValue.toLocaleString()}`)}
+            {detailRow('Entry Price', position.entryPrice ? `$${position.entryPrice.toLocaleString()}` : '-')}
+            {detailRow('Units', position.units ? position.units.toLocaleString() : '-')}
+            {detailRow('Unrealized PnL',
+              `${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+              pnl >= 0 ? '#00d4aa' : '#ef4444',
+            )}
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', py: 0.8 }}>
+              <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>Current LTV</Typography>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <Typography sx={{ fontSize: 14, fontWeight: 700, color: ltvColor }}>
+                  {(position.currentLTV * 100).toFixed(1)}%
+                </Typography>
+                <Box sx={{ width: 60, height: 6, bgcolor: 'rgba(255,255,255,0.05)', borderRadius: 3, position: 'relative' }}>
+                  <Box sx={{ width: `${Math.min(position.currentLTV * 100, 100)}%`, height: '100%', bgcolor: ltvColor, borderRadius: 3 }} />
+                </Box>
+              </Box>
+            </Box>
+            {detailRow('LTV Threshold', `${(ltvThreshold * 100).toFixed(0)}%`, '#f59e0b')}
+
+            {position.status === 'MarginCalled' && (
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 1.5, p: 1.5, bgcolor: 'rgba(239,68,68,0.1)', borderRadius: '8px', border: '1px solid rgba(239,68,68,0.3)' }}>
+                <Warning sx={{ color: '#ef4444', fontSize: 18 }} />
+                <Typography sx={{ fontSize: 12, color: '#ef4444' }}>
+                  LTV has breached the {(ltvThreshold * 100).toFixed(0)}% threshold. Position is at risk of liquidation.
+                </Typography>
+              </Box>
+            )}
+          </Box>
+        )}
+
+        {/* Liquidated — liquidation breakdown */}
+        {position.status === 'Liquidated' && (
+          <Box>
+            <Box sx={{ bgcolor: 'rgba(239,68,68,0.08)', borderRadius: '8px', p: 2, mb: 2, border: '1px solid rgba(239,68,68,0.2)' }}>
+              <Typography sx={{ fontSize: 14, fontWeight: 600, color: '#ef4444', mb: 1 }}>
+                Liquidation Summary
+              </Typography>
+              {liqRecord ? (
+                <>
+                  {detailRow('Liquidated At', new Date(liqRecord.liquidatedAt).toLocaleString())}
+                  {detailRow('PnL at Liquidation',
+                    `${liqRecord.pnl >= 0 ? '+' : ''}$${liqRecord.pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+                    liqRecord.pnl >= 0 ? '#00d4aa' : '#ef4444',
+                  )}
+                  {detailRow('Amount Owed', `$${liqRecord.liquidationAmountUSD.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, '#ef4444')}
+                  {detailRow('Collateral at Liquidation', `$${liqRecord.collateralValueAtLiquidation.toLocaleString()}`)}
+                  {detailRow('LTV at Liquidation', `${(liqRecord.ltvAtLiquidation * 100).toFixed(1)}%`, '#ef4444')}
+                  {detailRow('LTV Threshold', `${(liqRecord.ltvThreshold * 100).toFixed(0)}%`, '#f59e0b')}
+                </>
+              ) : (
+                <>
+                  {detailRow('Notional Value', `$${position.notionalValue.toLocaleString()}`)}
+                  {detailRow('Collateral Value', `$${position.collateralValue.toLocaleString()}`)}
+                  {detailRow('PnL',
+                    `${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+                    pnl >= 0 ? '#00d4aa' : '#ef4444',
+                  )}
+                  <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', mt: 1, fontStyle: 'italic' }}>
+                    Detailed liquidation breakdown not available (liquidated before this session)
+                  </Typography>
+                </>
+              )}
+            </Box>
+
+            {/* EVM Escrow Seizures table */}
+            {liqRecord && liqRecord.escrowLiquidations.length > 0 && (
+              <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2, mb: 2 }}>
+                <Typography sx={{ fontSize: 13, fontWeight: 600, color: 'white', mb: 1 }}>EVM Escrow Seizures</Typography>
+                <TableContainer>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell sx={{ ...thSx, py: 1 }}>Chain</TableCell>
+                        <TableCell sx={{ ...thSx, py: 1 }}>Escrow</TableCell>
+                        <TableCell sx={{ ...thSx, py: 1 }} align="right">ETH</TableCell>
+                        <TableCell sx={{ ...thSx, py: 1 }} align="right">USDC</TableCell>
+                        <TableCell sx={{ ...thSx, py: 1 }}>Tx</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {liqRecord.escrowLiquidations.map((esc, i) => (
+                        <TableRow key={i}>
+                          <TableCell sx={{ ...tdSx, fontSize: 12 }}>{esc.chain}</TableCell>
+                          <TableCell sx={{ ...tdSx, fontSize: 11, fontFamily: 'monospace', color: 'rgba(255,255,255,0.5)' }}>
+                            {esc.custodyAddress.slice(0, 8)}...{esc.custodyAddress.slice(-6)}
+                          </TableCell>
+                          <TableCell sx={{ ...tdSx, fontSize: 12, fontWeight: 600 }} align="right">
+                            {parseFloat(esc.ethSeized) > 0 ? `${esc.ethSeized} ($${esc.ethValueUSD.toLocaleString(undefined, { maximumFractionDigits: 0 })})` : '-'}
+                          </TableCell>
+                          <TableCell sx={{ ...tdSx, fontSize: 12, fontWeight: 600 }} align="right">
+                            {parseFloat(esc.usdcSeized) > 0 ? `$${esc.usdcSeized}` : '-'}
+                          </TableCell>
+                          <TableCell sx={{ ...tdSx, fontSize: 11 }}>
+                            {esc.txHashes.length > 0 ? esc.txHashes.map((tx, j) => (
+                              <Typography key={j} sx={{ fontSize: 11, fontFamily: 'monospace', color: '#60a5fa' }}>
+                                {tx.slice(0, 10)}...
+                              </Typography>
+                            )) : '-'}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Box>
+            )}
+
+            {/* CC Seized table */}
+            {liqRecord && liqRecord.ccSeized.length > 0 && (
+              <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2, mb: 2 }}>
+                <Typography sx={{ fontSize: 13, fontWeight: 600, color: 'white', mb: 1 }}>CC Assets Seized</Typography>
+                <TableContainer>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell sx={{ ...thSx, py: 1 }}>Symbol</TableCell>
+                        <TableCell sx={{ ...thSx, py: 1 }} align="right">Amount</TableCell>
+                        <TableCell sx={{ ...thSx, py: 1 }} align="right">Value USD</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {liqRecord.ccSeized.map((cc, i) => (
+                        <TableRow key={i}>
+                          <TableCell sx={{ ...tdSx, fontSize: 12, fontWeight: 600 }}>{displaySymbol(cc.symbol)}</TableCell>
+                          <TableCell sx={{ ...tdSx, fontSize: 12 }} align="right">{cc.amount.toLocaleString()}</TableCell>
+                          <TableCell sx={{ ...tdSx, fontSize: 12, fontWeight: 600 }} align="right">${cc.valueUSD.toLocaleString()}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Box>
+            )}
+
+            {/* Canton Settlement table */}
+            {liqRecord && liqRecord.cantonSettlement && liqRecord.cantonSettlement.length > 0 && (
+              <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2, mb: 2 }}>
+                <Typography sx={{ fontSize: 13, fontWeight: 600, color: 'white', mb: 1 }}>Canton Settlement</Typography>
+                <TableContainer>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell sx={{ ...thSx, py: 1 }}>Symbol</TableCell>
+                        <TableCell sx={{ ...thSx, py: 1 }} align="right">Amount</TableCell>
+                        <TableCell sx={{ ...thSx, py: 1 }} align="right">Value USD</TableCell>
+                        <TableCell sx={{ ...thSx, py: 1 }}>Source</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {liqRecord.cantonSettlement.map((cs, i) => (
+                        <TableRow key={i}>
+                          <TableCell sx={{ ...tdSx, fontSize: 12, fontWeight: 600 }}>{displaySymbol(cs.symbol)}</TableCell>
+                          <TableCell sx={{ ...tdSx, fontSize: 12 }} align="right">{cs.amount.toLocaleString()}</TableCell>
+                          <TableCell sx={{ ...tdSx, fontSize: 12, fontWeight: 600 }} align="right">${cs.valueUSD.toLocaleString()}</TableCell>
+                          <TableCell sx={{ ...tdSx, fontSize: 12 }}>
+                            <Chip
+                              label={cs.source === 'bridge' ? 'Bridge' : 'Direct'}
+                              size="small"
+                              sx={{
+                                bgcolor: cs.source === 'bridge' ? 'rgba(96,165,250,0.15)' : 'rgba(0,212,170,0.15)',
+                                color: cs.source === 'bridge' ? '#60a5fa' : '#00d4aa',
+                                fontWeight: 600, fontSize: 10, height: 20,
+                              }}
+                            />
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Box>
+            )}
+
+            {/* Broker recipient + totals */}
+            {liqRecord && (
+              <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2 }}>
+                {liqRecord.brokerCantonParty && detailRow('Broker Canton Party', `${liqRecord.brokerCantonParty.split('::')[0]}`)}
+                {liqRecord.brokerRecipient && detailRow('Broker EVM Address', `${liqRecord.brokerRecipient.slice(0, 10)}...${liqRecord.brokerRecipient.slice(-8)}`)}
+                {(() => {
+                  const totalEscrowUSD = liqRecord.escrowLiquidations.reduce((s, e) => s + e.ethValueUSD + (parseFloat(e.usdcSeized) || 0), 0);
+                  const totalCCUSD = liqRecord.ccSeized.reduce((s, c) => s + c.valueUSD, 0);
+                  const totalCantonUSD = (liqRecord.cantonSettlement || []).reduce((s, c) => s + c.valueUSD, 0);
+                  return (
+                    <>
+                      {detailRow('Total Seized', `$${(totalEscrowUSD + totalCCUSD).toLocaleString(undefined, { maximumFractionDigits: 2 })}`)}
+                      {totalCantonUSD > 0 && detailRow('Canton Settlement Total', `$${totalCantonUSD.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, '#60a5fa')}
+                      {detailRow('Amount Owed', `$${liqRecord.liquidationAmountUSD.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, '#ef4444')}
+                    </>
+                  );
+                })()}
+              </Box>
+            )}
+          </Box>
+        )}
+
+        {/* Closed — simple close info */}
+        {position.status === 'Closed' && (
+          <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2 }}>
+            <Typography sx={{ fontSize: 14, fontWeight: 600, color: 'white', mb: 1 }}>Close Details</Typography>
+            {detailRow('Notional Value', `$${position.notionalValue.toLocaleString()}`)}
+            {detailRow('Final PnL',
+              `${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+              pnl >= 0 ? '#00d4aa' : '#ef4444',
+            )}
+          </Box>
+        )}
+      </DialogContent>
+      <DialogActions sx={{ px: 3, pb: 2 }}>
+        <Button onClick={onClose} sx={{ color: 'rgba(255,255,255,0.5)', textTransform: 'none' }}>
+          Close
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
 
 // Fund View
 function FundPositions({ user }: { user: AuthUser }) {
@@ -39,6 +368,7 @@ function FundPositions({ user }: { user: AuthUser }) {
   const [openCreate, setOpenCreate] = useState(false);
   const [creating, setCreating] = useState(false);
   const [closing, setClosing] = useState<string | null>(null);
+  const [detailPosition, setDetailPosition] = useState<PositionData | null>(null);
 
   // Multi-step form state
   const [step, setStep] = useState(1);
@@ -71,7 +401,15 @@ function FundPositions({ user }: { user: AuthUser }) {
   const allowedAssets = selectedLink?.allowedAssets || [];
   const notionalValue = form.units && livePrice ? parseFloat(form.units) * livePrice : 0;
   const selectedVault = vaults.find((v: any) => v.vaultId === form.vaultId);
-  const ltvPreview = selectedVault && selectedVault.totalValue > 0 ? notionalValue / selectedVault.totalValue : 0;
+
+  // Sum existing open positions' notional on the selected vault for aggregate LTV preview
+  const existingNotionalOnVault = (vaultId: string) =>
+    positions.filter(p => p.vaultId === vaultId && (p.status === 'Open' || p.status === 'MarginCalled'))
+      .reduce((sum, p) => sum + p.notionalValue, 0);
+
+  const ltvPreview = selectedVault && selectedVault.totalValue > 0
+    ? (existingNotionalOnVault(selectedVault.vaultId) + notionalValue) / selectedVault.totalValue
+    : 0;
 
   // Fetch live price when asset changes
   useEffect(() => {
@@ -172,7 +510,7 @@ function FundPositions({ user }: { user: AuthUser }) {
         </Box>
       )}
 
-      {/* Position List */}
+      {/* Position Table */}
       {positions.length === 0 ? (
         <Box
           sx={{
@@ -193,86 +531,64 @@ function FundPositions({ user }: { user: AuthUser }) {
           </Typography>
         </Box>
       ) : (
-        <Grid container spacing={2}>
-          {positions.map((pos) => {
-            const threshold = getThreshold(pos.broker);
-            const ltvColor = getLTVColor(pos.currentLTV, threshold);
-            return (
-              <Grid item xs={12} md={6} key={pos.contractId}>
-                <Box
-                  sx={{
-                    bgcolor: '#111820',
-                    borderRadius: '12px',
-                    border: `1px solid ${pos.status === 'MarginCalled' ? 'rgba(239,68,68,0.3)' : 'rgba(255,255,255,0.06)'}`,
-                    p: 2.5,
-                  }}
-                >
-                  <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1.5 }}>
-                    <Box>
-                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                        <Typography sx={{ fontSize: 15, fontWeight: 600, color: 'white' }}>
-                          {pos.positionId}
-                        </Typography>
-                        <Chip
-                          label={pos.direction || 'Long'}
-                          size="small"
-                          sx={{
-                            bgcolor: pos.direction === 'Short' ? 'rgba(239,68,68,0.15)' : 'rgba(0,212,170,0.15)',
-                            color: pos.direction === 'Short' ? '#ef4444' : '#00d4aa',
-                            fontWeight: 700,
-                            fontSize: 10,
-                            height: 20,
-                          }}
-                        />
-                      </Box>
-                      <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>
-                        {pos.description || 'No description'}
-                      </Typography>
-                    </Box>
-                    <Chip
-                      label={pos.status}
-                      size="small"
-                      sx={{
-                        bgcolor: pos.status === 'Open' ? 'rgba(0,212,170,0.2)' :
-                                 pos.status === 'MarginCalled' ? 'rgba(239,68,68,0.2)' :
-                                 pos.status === 'Liquidated' ? 'rgba(239,68,68,0.2)' :
-                                 'rgba(255,255,255,0.1)',
-                        color: pos.status === 'Open' ? '#00d4aa' :
-                               pos.status === 'MarginCalled' ? '#ef4444' :
-                               pos.status === 'Liquidated' ? '#ef4444' :
-                               'rgba(255,255,255,0.5)',
-                        fontWeight: 600,
-                        fontSize: 11,
-                      }}
-                    />
-                  </Box>
-
-                  <Grid container spacing={2} sx={{ mb: 1.5 }}>
-                    <Grid item xs={3}>
-                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>Notional</Typography>
-                      <Typography sx={{ fontSize: 14, fontWeight: 600, color: 'white' }}>
-                        ${pos.notionalValue.toLocaleString()}
-                      </Typography>
-                    </Grid>
-                    <Grid item xs={3}>
-                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>Collateral</Typography>
-                      <Typography sx={{ fontSize: 14, fontWeight: 600, color: 'white' }}>
-                        ${pos.collateralValue.toLocaleString()}
-                      </Typography>
-                    </Grid>
-                    <Grid item xs={3}>
-                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>PnL</Typography>
-                      <Typography sx={{
-                        fontSize: 14, fontWeight: 600,
-                        color: pos.unrealizedPnL >= 0 ? '#00d4aa' : '#ef4444',
-                      }}>
-                        {pos.unrealizedPnL >= 0 ? '+' : ''}{pos.unrealizedPnL !== 0 ? `$${pos.unrealizedPnL.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '$0'}
-                      </Typography>
-                    </Grid>
-                    <Grid item xs={3}>
-                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>LTV</Typography>
-                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                        <Typography sx={{ fontSize: 14, fontWeight: 600, color: ltvColor }}>
+        <TableContainer sx={{ bgcolor: '#111820', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.06)' }}>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell sx={thSx}>Position</TableCell>
+                <TableCell sx={thSx}>Direction</TableCell>
+                <TableCell sx={thSx}>Description</TableCell>
+                <TableCell sx={thSx} align="right">Notional</TableCell>
+                <TableCell sx={thSx} align="right">Collateral</TableCell>
+                <TableCell sx={thSx} align="right">PnL</TableCell>
+                <TableCell sx={thSx} align="right">LTV</TableCell>
+                <TableCell sx={thSx}>Status</TableCell>
+                <TableCell sx={thSx}>Broker</TableCell>
+                <TableCell sx={thSx} align="right">Action</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {positions.map((pos) => {
+                const threshold = getThreshold(pos.broker);
+                const ltvColor = getLTVColor(pos.currentLTV, threshold);
+                return (
+                  <TableRow
+                    key={pos.contractId}
+                    onClick={() => setDetailPosition(pos)}
+                    sx={{ '&:hover': { bgcolor: 'rgba(255,255,255,0.02)' }, cursor: 'pointer' }}
+                  >
+                    <TableCell sx={tdSx}>
+                      <Typography sx={{ fontSize: 13, fontWeight: 600 }}>{pos.positionId}</Typography>
+                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Vault: {pos.vaultId}</Typography>
+                    </TableCell>
+                    <TableCell sx={tdSx}>
+                      <Chip
+                        label={pos.direction || 'Long'}
+                        size="small"
+                        sx={{
+                          bgcolor: pos.direction === 'Short' ? 'rgba(239,68,68,0.15)' : 'rgba(0,212,170,0.15)',
+                          color: pos.direction === 'Short' ? '#ef4444' : '#00d4aa',
+                          fontWeight: 700,
+                          fontSize: 10,
+                          height: 20,
+                        }}
+                      />
+                    </TableCell>
+                    <TableCell sx={{ ...tdSx, color: 'rgba(255,255,255,0.6)', maxWidth: 150 }}>
+                      {pos.description || '-'}
+                    </TableCell>
+                    <TableCell sx={{ ...tdSx, fontWeight: 600 }} align="right">
+                      ${pos.notionalValue.toLocaleString()}
+                    </TableCell>
+                    <TableCell sx={{ ...tdSx, fontWeight: 600 }} align="right">
+                      ${pos.collateralValue.toLocaleString()}
+                    </TableCell>
+                    <TableCell sx={{ ...tdSx, fontWeight: 600, color: pos.unrealizedPnL >= 0 ? '#00d4aa' : '#ef4444' }} align="right">
+                      {pos.unrealizedPnL >= 0 ? '+' : ''}${pos.unrealizedPnL.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell sx={tdSx} align="right">
+                      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 0.5 }}>
+                        <Typography sx={{ fontSize: 13, fontWeight: 700, color: ltvColor }}>
                           {(pos.currentLTV * 100).toFixed(1)}%
                         </Typography>
                         <Chip
@@ -287,30 +603,32 @@ function FundPositions({ user }: { user: AuthUser }) {
                           }}
                         />
                       </Box>
-                    </Grid>
-                  </Grid>
-
-                  <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>
-                      Vault: {pos.vaultId} &middot; Broker: {pos.broker.split('::')[0]}
-                    </Typography>
-                    {pos.status === 'Open' && (
-                      <Button
-                        size="small"
-                        startIcon={<Close />}
-                        onClick={() => handleClose(pos.contractId)}
-                        disabled={closing === pos.contractId}
-                        sx={{ color: 'rgba(255,255,255,0.4)', textTransform: 'none', fontSize: 12 }}
-                      >
-                        Close
-                      </Button>
-                    )}
-                  </Box>
-                </Box>
-              </Grid>
-            );
-          })}
-        </Grid>
+                    </TableCell>
+                    <TableCell sx={tdSx}>
+                      <Chip label={pos.status} size="small" sx={statusChipSx(pos.status)} />
+                    </TableCell>
+                    <TableCell sx={{ ...tdSx, color: 'rgba(255,255,255,0.5)', fontSize: 12 }}>
+                      {pos.broker.split('::')[0]}
+                    </TableCell>
+                    <TableCell sx={tdSx} align="right">
+                      {pos.status === 'Open' && (
+                        <Button
+                          size="small"
+                          startIcon={<Close />}
+                          onClick={(e) => { e.stopPropagation(); handleClose(pos.contractId); }}
+                          disabled={closing === pos.contractId}
+                          sx={{ color: 'rgba(255,255,255,0.4)', textTransform: 'none', fontSize: 11, minWidth: 0 }}
+                        >
+                          {closing === pos.contractId ? '...' : 'Close'}
+                        </Button>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </TableContainer>
       )}
 
       {/* Create Position Dialog — 5-step flow */}
@@ -492,7 +810,8 @@ function FundPositions({ user }: { user: AuthUser }) {
               </Typography>
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
                 {vaults.map((v: any) => {
-                  const projectedLTV = v.totalValue > 0 ? notionalValue / v.totalValue : 0;
+                  const totalNotional = existingNotionalOnVault(v.vaultId) + notionalValue;
+                  const projectedLTV = v.totalValue > 0 ? totalNotional / v.totalValue : 0;
                   const threshold = selectedLink?.ltvThreshold || 0.8;
                   const ltvColor = getLTVColor(projectedLTV, threshold);
                   return (
@@ -610,6 +929,13 @@ function FundPositions({ user }: { user: AuthUser }) {
           )}
         </DialogActions>
       </Dialog>
+
+      {/* Position Detail Dialog */}
+      <PositionDetailDialog
+        position={detailPosition}
+        ltvThreshold={detailPosition ? getThreshold(detailPosition.broker) : 0.8}
+        onClose={() => setDetailPosition(null)}
+      />
     </Box>
   );
 }
@@ -623,6 +949,7 @@ function BrokerPositions({ user }: { user: AuthUser }) {
   const [openLiquidateConfirm, setOpenLiquidateConfirm] = useState(false);
   const [selectedPosition, setSelectedPosition] = useState<PositionData | null>(null);
   const [liquidateError, setLiquidateError] = useState('');
+  const [detailPosition, setDetailPosition] = useState<PositionData | null>(null);
 
   const partyId = user.partyId || user.id;
 
@@ -735,129 +1062,113 @@ function BrokerPositions({ user }: { user: AuthUser }) {
           </Typography>
         </Box>
       ) : (
-        <Grid container spacing={2}>
-          {filteredPositions.map((pos) => {
-            const threshold = getThreshold(pos.fund);
-            const ltvColor = getLTVColor(pos.currentLTV, threshold);
-            const approaching = pos.currentLTV >= threshold * 0.9;
-            const canLiquidate = (pos.status === 'Open' || pos.status === 'MarginCalled') && pos.currentLTV >= threshold;
-            return (
-              <Grid item xs={12} md={6} key={pos.contractId}>
-                <Box
-                  sx={{
-                    bgcolor: '#111820',
-                    borderRadius: '12px',
-                    border: `1px solid ${approaching ? `${ltvColor}40` : 'rgba(255,255,255,0.06)'}`,
-                    p: 2.5,
-                  }}
-                >
-                  <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1.5 }}>
-                    <Box>
-                      <Typography sx={{ fontSize: 15, fontWeight: 600, color: 'white' }}>
-                        {pos.positionId}
-                      </Typography>
-                      <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>
-                        Fund: {pos.fund.split('::')[0]}
-                      </Typography>
-                    </Box>
-                    <Chip
-                      label={pos.status}
-                      size="small"
-                      sx={{
-                        bgcolor: pos.status === 'Open' ? 'rgba(0,212,170,0.2)' :
-                                 pos.status === 'MarginCalled' ? 'rgba(239,68,68,0.2)' :
-                                 pos.status === 'Liquidated' ? 'rgba(239,68,68,0.2)' :
-                                 'rgba(255,255,255,0.1)',
-                        color: pos.status === 'Open' ? '#00d4aa' :
-                               pos.status === 'MarginCalled' ? '#ef4444' :
-                               pos.status === 'Liquidated' ? '#ef4444' :
-                               'rgba(255,255,255,0.5)',
-                        fontWeight: 600,
-                        fontSize: 11,
-                      }}
-                    />
-                  </Box>
-
-                  <Grid container spacing={2} sx={{ mb: 1 }}>
-                    <Grid item xs={4}>
-                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>Notional</Typography>
-                      <Typography sx={{ fontSize: 14, fontWeight: 600, color: 'white' }}>
-                        ${pos.notionalValue.toLocaleString()}
-                      </Typography>
-                    </Grid>
-                    <Grid item xs={4}>
-                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>Collateral</Typography>
-                      <Typography sx={{ fontSize: 14, fontWeight: 600, color: 'white' }}>
-                        ${pos.collateralValue.toLocaleString()}
-                      </Typography>
-                    </Grid>
-                    <Grid item xs={4}>
-                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>LTV</Typography>
-                      <Typography sx={{ fontSize: 16, fontWeight: 700, color: ltvColor }}>
-                        {(pos.currentLTV * 100).toFixed(1)}%
-                      </Typography>
-                    </Grid>
-                  </Grid>
-
-                  {/* LTV bar */}
-                  <Box sx={{ mt: 1, mb: 0.5 }}>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.3 }}>
-                      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.3)' }}>0%</Typography>
-                      <Typography sx={{ fontSize: 10, color: '#f59e0b' }}>Threshold: {(threshold * 100).toFixed(0)}%</Typography>
-                      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.3)' }}>100%</Typography>
-                    </Box>
-                    <Box sx={{ width: '100%', height: 6, bgcolor: 'rgba(255,255,255,0.05)', borderRadius: 3, position: 'relative' }}>
-                      <Box
-                        sx={{
-                          width: `${Math.min(pos.currentLTV * 100, 100)}%`,
-                          height: '100%',
-                          bgcolor: ltvColor,
-                          borderRadius: 3,
-                        }}
-                      />
-                      <Box
-                        sx={{
-                          position: 'absolute',
-                          left: `${threshold * 100}%`,
-                          top: -2,
-                          width: 2,
-                          height: 10,
-                          bgcolor: '#f59e0b',
-                          borderRadius: 1,
-                        }}
-                      />
-                    </Box>
-                  </Box>
-
-                  <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 1 }}>
-                    <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>
-                      Vault: {pos.vaultId}
-                    </Typography>
-                    {canLiquidate && (
-                      <Button
+        <TableContainer sx={{ bgcolor: '#111820', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.06)' }}>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell sx={thSx}>Position</TableCell>
+                <TableCell sx={thSx}>Fund</TableCell>
+                <TableCell sx={thSx}>Direction</TableCell>
+                <TableCell sx={thSx} align="right">Notional</TableCell>
+                <TableCell sx={thSx} align="right">Collateral</TableCell>
+                <TableCell sx={thSx} align="right">PnL</TableCell>
+                <TableCell sx={thSx} align="right">LTV</TableCell>
+                <TableCell sx={thSx} align="center">Threshold</TableCell>
+                <TableCell sx={thSx}>Status</TableCell>
+                <TableCell sx={thSx} align="right">Action</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {filteredPositions.map((pos) => {
+                const threshold = getThreshold(pos.fund);
+                const ltvColor = getLTVColor(pos.currentLTV, threshold);
+                const canLiquidate = (pos.status === 'Open' || pos.status === 'MarginCalled') && pos.currentLTV >= threshold;
+                return (
+                  <TableRow
+                    key={pos.contractId}
+                    onClick={() => setDetailPosition(pos)}
+                    sx={{
+                      '&:hover': { bgcolor: 'rgba(255,255,255,0.02)' },
+                      bgcolor: pos.currentLTV >= threshold * 0.9 ? `${ltvColor}08` : 'transparent',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <TableCell sx={tdSx}>
+                      <Typography sx={{ fontSize: 13, fontWeight: 600 }}>{pos.positionId}</Typography>
+                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Vault: {pos.vaultId}</Typography>
+                    </TableCell>
+                    <TableCell sx={{ ...tdSx, color: 'rgba(255,255,255,0.6)', fontSize: 12 }}>
+                      {pos.fund.split('::')[0]}
+                    </TableCell>
+                    <TableCell sx={tdSx}>
+                      <Chip
+                        label={pos.direction || 'Long'}
                         size="small"
-                        startIcon={<Gavel />}
-                        onClick={() => handleLiquidateClick(pos)}
-                        disabled={liquidating === pos.contractId}
                         sx={{
-                          color: '#ef4444',
-                          bgcolor: 'rgba(239,68,68,0.1)',
-                          textTransform: 'none',
-                          fontSize: 12,
-                          fontWeight: 600,
-                          px: 1.5,
-                          '&:hover': { bgcolor: 'rgba(239,68,68,0.2)' },
+                          bgcolor: pos.direction === 'Short' ? 'rgba(239,68,68,0.15)' : 'rgba(0,212,170,0.15)',
+                          color: pos.direction === 'Short' ? '#ef4444' : '#00d4aa',
+                          fontWeight: 700,
+                          fontSize: 10,
+                          height: 20,
                         }}
-                      >
-                        {liquidating === pos.contractId ? 'Liquidating...' : 'Liquidate'}
-                      </Button>
-                    )}
-                  </Box>
-                </Box>
-              </Grid>
-            );
-          })}
-        </Grid>
+                      />
+                    </TableCell>
+                    <TableCell sx={{ ...tdSx, fontWeight: 600 }} align="right">
+                      ${pos.notionalValue.toLocaleString()}
+                    </TableCell>
+                    <TableCell sx={{ ...tdSx, fontWeight: 600 }} align="right">
+                      ${pos.collateralValue.toLocaleString()}
+                    </TableCell>
+                    <TableCell sx={{ ...tdSx, fontWeight: 600, color: pos.unrealizedPnL >= 0 ? '#00d4aa' : '#ef4444' }} align="right">
+                      {pos.unrealizedPnL >= 0 ? '+' : ''}${pos.unrealizedPnL.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell sx={tdSx} align="right">
+                      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 0.5 }}>
+                        <Typography sx={{ fontSize: 14, fontWeight: 700, color: ltvColor }}>
+                          {(pos.currentLTV * 100).toFixed(1)}%
+                        </Typography>
+                        {/* Mini LTV bar */}
+                        <Box sx={{ width: 40, height: 4, bgcolor: 'rgba(255,255,255,0.05)', borderRadius: 2, position: 'relative', ml: 0.5 }}>
+                          <Box sx={{ width: `${Math.min(pos.currentLTV * 100, 100)}%`, height: '100%', bgcolor: ltvColor, borderRadius: 2 }} />
+                        </Box>
+                      </Box>
+                    </TableCell>
+                    <TableCell sx={tdSx} align="center">
+                      <Typography sx={{ fontSize: 12, color: '#f59e0b', fontWeight: 600 }}>
+                        {(threshold * 100).toFixed(0)}%
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={tdSx}>
+                      <Chip label={pos.status} size="small" sx={statusChipSx(pos.status)} />
+                    </TableCell>
+                    <TableCell sx={tdSx} align="right">
+                      {canLiquidate && (
+                        <Button
+                          size="small"
+                          startIcon={<Gavel />}
+                          onClick={(e) => { e.stopPropagation(); handleLiquidateClick(pos); }}
+                          disabled={liquidating === pos.contractId}
+                          sx={{
+                            color: '#ef4444',
+                            bgcolor: 'rgba(239,68,68,0.1)',
+                            textTransform: 'none',
+                            fontSize: 11,
+                            fontWeight: 600,
+                            px: 1.5,
+                            minWidth: 0,
+                            '&:hover': { bgcolor: 'rgba(239,68,68,0.2)' },
+                          }}
+                        >
+                          {liquidating === pos.contractId ? '...' : 'Liquidate'}
+                        </Button>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </TableContainer>
       )}
 
       {/* Liquidation Confirmation Dialog */}
@@ -875,7 +1186,8 @@ function BrokerPositions({ user }: { user: AuthUser }) {
         <DialogContent>
           {selectedPosition && (() => {
             const threshold = getThreshold(selectedPosition.fund);
-            const liquidationAmount = Math.min(selectedPosition.notionalValue, selectedPosition.collateralValue);
+            const pnl = selectedPosition.unrealizedPnL || 0;
+            const amountOwed = pnl < 0 ? Math.min(Math.abs(pnl), selectedPosition.collateralValue) : 0;
             return (
               <Box>
                 <Box sx={{ bgcolor: 'rgba(239,68,68,0.08)', borderRadius: '8px', p: 2, mb: 2, border: '1px solid rgba(239,68,68,0.2)' }}>
@@ -893,7 +1205,8 @@ function BrokerPositions({ user }: { user: AuthUser }) {
                     { label: 'LTV Threshold', value: `${(threshold * 100).toFixed(0)}%`, color: '#f59e0b' },
                     { label: 'Notional Value', value: `$${selectedPosition.notionalValue.toLocaleString()}` },
                     { label: 'Collateral Value', value: `$${selectedPosition.collateralValue.toLocaleString()}` },
-                    { label: 'Liquidation Amount', value: `$${liquidationAmount.toLocaleString()}`, color: '#ef4444' },
+                    { label: 'Unrealized PnL', value: `${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, color: pnl >= 0 ? '#00d4aa' : '#ef4444' },
+                    { label: 'Amount Owed (Loss)', value: `$${amountOwed.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, color: '#ef4444' },
                   ].map(row => (
                     <Box key={row.label} sx={{ display: 'flex', justifyContent: 'space-between', py: 0.8, borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
                       <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>{row.label}</Typography>
@@ -934,6 +1247,13 @@ function BrokerPositions({ user }: { user: AuthUser }) {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* Position Detail Dialog */}
+      <PositionDetailDialog
+        position={detailPosition}
+        ltvThreshold={detailPosition ? getThreshold(detailPosition.fund) : 0.8}
+        onClose={() => setDetailPosition(null)}
+      />
     </Box>
   );
 }

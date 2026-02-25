@@ -11,7 +11,8 @@
     "update-package-id": "PKGID=$(daml damlc inspect daml/.daml/dist/*.dar 2>/dev/null | head -1 | awk '{print $2}') && sed -i \"s/^PACKAGE_ID = .*/PACKAGE_ID = \\\"$PKGID\\\"/\" wrangler.toml && echo \"Updated PACKAGE_ID to $PKGID\"",
     "preview": "vite preview",
     "deploy": "npm run build && wrangler pages deploy dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "build:zk": "bash circuits/build.sh"
   },
   "dependencies": {
     "@emotion/react": "^11.11.1",
@@ -19,16 +20,22 @@
     "@mui/icons-material": "^5.14.19",
     "@mui/material": "^5.14.20",
     "@stratos-wallet/sdk": "file:../stratos-wallet-sdk",
+    "@types/jsonwebtoken": "^9.0.10",
+    "jsonwebtoken": "^9.0.3",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router-dom": "^6.20.1",
-    "recharts": "^2.10.3"
+    "recharts": "^2.10.3",
+    "snarkjs": "^0.7.6",
+    "viem": "^2.46.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240117.0",
     "@types/react": "^19.1.6",
     "@types/react-dom": "^19.1.5",
     "@vitejs/plugin-react": "^4.5.1",
+    "circom2": "^0.2.22",
+    "circomlib": "^2.0.5",
     "solc": "^0.8.34",
     "typescript": "~5.8.3",
     "vite": "^7.0.0",

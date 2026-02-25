@@ -10,7 +10,7 @@ crons = ["* * * * *"]
 [vars]
 CANTON_HOST = "p2-json.cantondefi.com"
 SPLICE_VALIDATOR_HOST = "p2-validator.cantondefi.com"
-PACKAGE_ID = "4a9840c0f6177ff757bdfc1d1c7f90cc2f7510d34d7c974d03c28d2f8eb18f30"
+PACKAGE_ID = "853e61bc849b9ebdbc3c1e9d7bab2f2e96681e276e68ba32c33019bf61d5d1f9"
 
 # Secrets (set via `wrangler secret put`):
 # - CANTON_AUTH_SECRET  — JWT signing secret for Canton JSON API

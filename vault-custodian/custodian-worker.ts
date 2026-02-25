@@ -68,7 +68,6 @@ async function cantonQuery(
 ): Promise<any[]> {
   const token = await generateJWT(env);
 
-  // Get ledger end offset first
   const offsetRes = await fetch(`https://${env.CANTON_HOST}/v2/state/ledger-end`, {
     headers: {
       'Authorization': `Bearer ${token}`,
@@ -81,7 +80,6 @@ async function cantonQuery(
   }
   const { offset } = await offsetRes.json() as { offset: number };
 
-  // Query active contracts
   const queryBody = {
     filter: {
       filtersByParty: {
@@ -131,7 +129,6 @@ async function cantonQuery(
     payload: c.contractEntry.JsActiveContract.createdEvent.createArgument,
   }));
 
-  // Client-side filtering
   if (filter) {
     contracts = contracts.filter(c =>
       Object.entries(filter).every(([k, v]) => c.payload[k] === v)
@@ -188,35 +185,6 @@ async function spliceAcceptOffer(env: Env, offerId: string): Promise<boolean> {
   return true;
 }
 
-async function spliceCreateTransferOffer(
-  env: Env,
-  receiver: string,
-  amount: string,
-): Promise<boolean> {
-  const token = await generateJWT(env);
-  const url = `https://${env.SPLICE_VALIDATOR_HOST}/api/validator/v0/wallet/transfer-offers`;
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      receiver_party_id: receiver,
-      amount,
-    }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    console.error(`Splice create transfer offer failed: ${res.status} ${text}`);
-    return false;
-  }
-
-  return true;
-}
-
 // ============================================
 // MAIN JOBS
 // ============================================
@@ -248,27 +216,12 @@ async function acceptTransferOffers(env: Env): Promise<number> {
 }
 
 /**
- * Job 2: Process withdrawals
- * Checks for vault contracts where a WithdrawAsset was exercised.
- * When the vault's collateral has decreased (withdrawal detected), create a
- * return transfer offer from custodian to the vault owner.
- *
- * Note: In the current design, the Daml WithdrawAsset choice archives/recreates
- * the vault contract. A more robust approach would use the Canton updates stream
- * to detect exercise events. For now, we rely on the frontend or a separate
- * mechanism to signal withdrawals.
+ * Job 2: Process withdrawals (placeholder)
  */
 async function processWithdrawals(env: Env): Promise<number> {
   const VAULT_TEMPLATE = `${env.PACKAGE_ID}:CollateralVault:CollateralVault`;
-
-  // Query all vault contracts where custodian is operator
   const vaults = await cantonQuery(env, VAULT_TEMPLATE, { operator: env.CUSTODIAN_PARTY });
   console.log(`Found ${vaults.length} vaults managed by custodian`);
-
-  // For now, just log — withdrawal detection requires either:
-  // 1. Polling the Canton updates/transactions stream for WithdrawAsset exercises
-  // 2. A webhook/signal from the frontend when a withdrawal is exercised
-  // This will be implemented in a future iteration with the updates endpoint
   return 0;
 }
 

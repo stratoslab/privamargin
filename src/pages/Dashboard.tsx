@@ -1,12 +1,10 @@
 import { useState, useEffect } from 'react';
-import { Box, Typography, Button, Grid, CircularProgress, Alert, Chip } from '@mui/material';
-import { Add, Visibility, VisibilityOff, Lock, LockOpen, TrendingUp, Warning, Shield, AccountBalance } from '@mui/icons-material';
+import { Box, Typography, Button, Grid, CircularProgress, Alert } from '@mui/material';
+import { Add, Visibility, VisibilityOff, Lock, LockOpen, TrendingUp, Warning, Shield } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 import { vaultAPI, marginAPI, invitationAPI, positionAPI, linkAPI, workflowMarginCallAPI, getCustodianParty } from '../services/api';
 import type { PositionData, BrokerFundLinkData, WorkflowMarginCallData } from '../services/api';
-import { CHAIN_CONFIG, CHAIN_ID_TO_NAME, CHAIN_TYPE_TO_IDS } from '../services/evmEscrow';
 import { useRole } from '../context/RoleContext';
-import { getSDK } from '@stratos-wallet/sdk';
 import type { AuthUser, Asset } from '@stratos-wallet/sdk';
 
 interface DashboardProps {
@@ -63,7 +61,7 @@ function FundDashboard({ user, assets }: DashboardProps) {
   const [totalValue, setTotalValue] = useState(0);
   const [pendingInvitations, setPendingInvitations] = useState(0);
   const [positions, setPositions] = useState<PositionData[]>([]);
-  const [zkProof] = useState('eyJjb21taXRtZW50IjoiT1RRMk1qazJNRGc0T0RBd09UWTVPRFl3...');
+  const [zkProof, setZkProof] = useState('Generating...');
   const navigate = useNavigate();
 
   void assets;
@@ -87,6 +85,33 @@ function FundDashboard({ user, assets }: DashboardProps) {
       setMarginCalls(callsRes.data);
       setPendingInvitations(invRes.data.length);
       setPositions(posRes.data);
+
+      // Generate real ZK proof for dashboard display
+      if (vaultsRes.data.length > 0 && posRes.data.length > 0) {
+        try {
+          const { isZKAvailable, generateLTVProof, proofHash, usdToCents, ltvToBps } =
+            await import('../services/zkProof');
+          if (await isZKAvailable()) {
+            const vault = vaultsRes.data[0];
+            const position = posRes.data[0];
+            const assetCents = (vault.collateralAssets || []).map((a: any) => usdToCents(a.valueUSD || 0));
+            const result = await generateLTVProof({
+              assetValuesCents: assetCents,
+              notionalValueCents: usdToCents(position.notionalValue || 0),
+              ltvThresholdBps: ltvToBps(0.8),
+            });
+            const hash = await proofHash(result.proof);
+            setZkProof(hash);
+          } else {
+            setZkProof('ZK artifacts not available');
+          }
+        } catch (err) {
+          console.warn('Dashboard ZK proof generation failed:', err);
+          setZkProof('Proof generation failed');
+        }
+      } else {
+        setZkProof('No vault/position data');
+      }
     } catch (error) {
       console.error('Error loading data:', error);
     }
@@ -739,162 +764,70 @@ function CustodianPanel() {
   );
 }
 
-// Deposit Relay Panel — shown on operator dashboard for per-chain relay deployment
-function RelayPanel() {
-  const [deploying, setDeploying] = useState<number | null>(null);
-  const [error, setError] = useState<string>('');
-  const [success, setSuccess] = useState<string>('');
-  // EVM chains detected from wallet SDK
-  const [walletChains, setWalletChains] = useState<Array<{ chainId: number; name: string; address: string }>>([]);
-  const [walletsLoading, setWalletsLoading] = useState(true);
-  // Track deployed relay addresses
-  const [relayAddresses, setRelayAddresses] = useState<Record<number, string>>({});
+
+// Escrow Deployer Panel — shows deployer EOA address and config status
+function DeployerPanel() {
+  const [deployerAddress, setDeployerAddress] = useState<string | null>(null);
+  const [configured, setConfigured] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    detectEVMChains();
+    (async () => {
+      try {
+        const res = await fetch('/api/escrow/deploy');
+        const data = await res.json() as { deployerAddress?: string; configured?: boolean };
+        setDeployerAddress(data.deployerAddress || null);
+        setConfigured(!!data.configured);
+      } catch {
+        // ignore
+      }
+      setLoading(false);
+    })();
   }, []);
 
-  const detectEVMChains = async () => {
-    try {
-      const sdk = getSDK();
-      const addresses = await sdk.getAddresses();
-      // A single wallet address works on all chains of the same type.
-      // e.g. one "evm" address → Ethereum + Sepolia; one "base" address → Base + Base Sepolia
-      const evmChains: Array<{ chainId: number; name: string; address: string }> = [];
-      const seenTypes = new Set<string>();
-      for (const addr of addresses) {
-        const chainType = addr.chainType;
-        if ((chainType === 'evm' || chainType === 'base') && !seenTypes.has(chainType)) {
-          seenTypes.add(chainType);
-          const chainIds = CHAIN_TYPE_TO_IDS[chainType] || [];
-          for (const chainId of chainIds) {
-            if (CHAIN_CONFIG[chainId]) {
-              evmChains.push({
-                chainId,
-                name: CHAIN_ID_TO_NAME[chainId] || `Chain ${chainId}`,
-                address: addr.address,
-              });
-            }
-          }
-        }
-      }
-      setWalletChains(evmChains);
-
-      // Load existing relay addresses for detected chains
-      const addrs: Record<number, string> = {};
-      for (const c of evmChains) {
-        const cfg = CHAIN_CONFIG[c.chainId];
-        if (cfg?.relay) addrs[c.chainId] = cfg.relay;
-      }
-      setRelayAddresses(addrs);
-    } catch (err) {
-      console.warn('Failed to detect EVM chains from wallet:', err);
-    }
-    setWalletsLoading(false);
-  };
-
-  const handleDeploy = async (chainId: number) => {
-    setDeploying(chainId);
-    setError('');
-    setSuccess('');
-    try {
-      // Pass the wallet address for this chain so deploy doesn't re-query
-      const chain = walletChains.find(c => c.chainId === chainId);
-      const result = await vaultAPI.deployDepositRelay(chainId, chain?.address);
-      setRelayAddresses(prev => ({ ...prev, [chainId]: result.data.contractAddress }));
-      setSuccess(`Relay deployed on ${CHAIN_ID_TO_NAME[chainId] || chainId}: ${result.data.contractAddress.slice(0, 16)}...`);
-    } catch (err: unknown) {
-      console.error('[RelayPanel] Deploy failed:', err);
-      const msg = err instanceof Error ? err.message : typeof err === 'object' && err !== null ? JSON.stringify(err) : 'Deploy failed';
-      setError(msg);
-    }
-    setDeploying(null);
-  };
-
-  const availableChains = walletChains.map(c => c.chainId);
-  const allDeployed = availableChains.length > 0 && availableChains.every(id => relayAddresses[id]);
+  if (loading) return null;
 
   return (
     <Box
       sx={{
         bgcolor: '#111820',
         borderRadius: '12px',
-        border: `1px solid ${allDeployed ? 'rgba(139,92,246,0.2)' : 'rgba(255,165,0,0.2)'}`,
+        border: `1px solid ${configured ? 'rgba(96,165,250,0.2)' : 'rgba(255,165,0,0.2)'}`,
         p: 3,
         mb: 3,
       }}
     >
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: deployerAddress ? 2 : 0 }}>
         <Box
           sx={{
             width: 40,
             height: 40,
             borderRadius: '10px',
-            bgcolor: allDeployed ? 'rgba(139,92,246,0.1)' : 'rgba(255,165,0,0.1)',
-            border: `2px solid ${allDeployed ? '#8b5cf6' : '#ffa500'}`,
+            bgcolor: configured ? 'rgba(96,165,250,0.1)' : 'rgba(255,165,0,0.1)',
+            border: `2px solid ${configured ? '#60a5fa' : '#ffa500'}`,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
           }}
         >
-          <AccountBalance sx={{ color: allDeployed ? '#8b5cf6' : '#ffa500', fontSize: 20 }} />
+          <Shield sx={{ color: configured ? '#60a5fa' : '#ffa500', fontSize: 20 }} />
         </Box>
         <Box sx={{ flex: 1 }}>
-          <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'white' }}>Deposit Relay</Typography>
+          <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'white' }}>Escrow Deployer</Typography>
           <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>
-            {walletsLoading
-              ? 'Detecting EVM wallets...'
-              : walletChains.length === 0
-              ? 'No EVM wallets detected — add an Ethereum wallet in the portal'
-              : allDeployed
-              ? 'Privacy pool active on all chains — deposits are routed through relay'
-              : `${walletChains.length} EVM chain${walletChains.length > 1 ? 's' : ''} detected — deploy relay contracts for privacy`}
+            {configured ? 'Dedicated deployer EOA configured' : 'Not configured — set DEPLOYER_PRIVATE_KEY and API_SECRET'}
           </Typography>
         </Box>
       </Box>
 
-      <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap', mb: error || success ? 1.5 : 0 }}>
-        {availableChains.map(chainId => {
-          const name = CHAIN_ID_TO_NAME[chainId] || `Chain ${chainId}`;
-          const addr = relayAddresses[chainId];
-          return addr ? (
-            <Chip
-              key={chainId}
-              icon={<AccountBalance sx={{ fontSize: 14 }} />}
-              label={`${name}: ${addr.slice(0, 12)}...`}
-              size="small"
-              variant="outlined"
-              sx={{
-                fontFamily: 'monospace',
-                fontSize: '0.7rem',
-                borderColor: 'rgba(139,92,246,0.4)',
-                color: '#a78bfa',
-              }}
-            />
-          ) : (
-            <Button
-              key={chainId}
-              variant="outlined"
-              size="small"
-              disabled={deploying !== null}
-              onClick={() => handleDeploy(chainId)}
-              startIcon={deploying === chainId ? <CircularProgress size={14} /> : <AccountBalance sx={{ fontSize: 14 }} />}
-              sx={{
-                borderColor: 'rgba(255,165,0,0.5)',
-                color: '#ffa500',
-                textTransform: 'none',
-                fontSize: '0.75rem',
-                '&:hover': { borderColor: '#ffa500', bgcolor: 'rgba(255,165,0,0.08)' },
-              }}
-            >
-              {deploying === chainId ? 'Deploying...' : `Deploy on ${name}`}
-            </Button>
-          );
-        })}
-      </Box>
-
-      {error && <Alert severity="error" sx={{ mt: 1 }}>{error}</Alert>}
-      {success && <Alert severity="success" sx={{ mt: 1 }}>{success}</Alert>}
+      {deployerAddress && (
+        <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 1.5 }}>
+          <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', mb: 0.5 }}>Deployer Address</Typography>
+          <Typography sx={{ fontSize: 12, color: '#60a5fa', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+            {deployerAddress}
+          </Typography>
+        </Box>
+      )}
     </Box>
   );
 }
@@ -977,9 +910,11 @@ function OperatorDashboard({ user }: { user: AuthUser }) {
         </Grid>
       </Grid>
 
-      {/* Custodian + Relay Panels */}
+      {/* Custodian Panel */}
       <CustodianPanel />
-      <RelayPanel />
+
+      {/* Deployer Panel */}
+      <DeployerPanel />
 
       {/* Connected as */}
       <Box

@@ -1,0 +1,45 @@
+module CollateralLock where
+
+import Assets
+
+-- A binding commitment that the owner has pledged assets as collateral.
+-- No actual transfer occurs — CC stays in the owner's wallet.
+-- The lock represents an encumbrance: the owner promises not to spend
+-- the locked amount while the lock is active.
+--
+-- Release paths:
+--   Unlock      — owner voluntarily withdraws collateral
+--   ForceLiquidate — operator can seize during margin call (future)
+
+template CollateralLock
+  with
+    owner: Party
+    operator: Party
+    vaultId: Text
+    assetType: AssetType
+    symbol: Text
+    amount: Decimal
+    valueUSD: Decimal
+    lockId: Text
+  where
+    signatory owner
+    observer operator
+
+    -- Owner releases the lock (withdrawal)
+    choice Unlock : ()
+      controller owner
+      do return ()
+
+    -- Operator can force-liquidate during a margin call
+    choice ForceLiquidate : ()
+      with
+        reason : Text
+      controller operator
+      do return ()
+
+    -- Update the USD valuation (for LTV recalc)
+    choice UpdateLockValue : ContractId CollateralLock
+      with
+        newValueUSD : Decimal
+      controller operator
+      do create this with valueUSD = newValueUSD

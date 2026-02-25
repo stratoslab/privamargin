@@ -40,8 +40,8 @@ contract VaultEscrow {
     event Withdrawn(address indexed to, uint256 amount);
     event Liquidated(address indexed to, uint256 ethAmount, uint256 stablecoinAmount);
 
-    constructor(address _liquidator, address _swapRouter, address _weth, address _stablecoin) {
-        owner = msg.sender;
+    constructor(address _owner, address _liquidator, address _swapRouter, address _weth, address _stablecoin) {
+        owner = _owner;
         liquidator = _liquidator;
         swapRouter = _swapRouter;
         weth = _weth;

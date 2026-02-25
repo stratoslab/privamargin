@@ -23,7 +23,8 @@ template CollateralVault
     chainVaults: Optional [(Text, Text)]      -- [(chain, custodyAddress)]
     depositRecords: Optional [(Text, Text, Text, Text)]  -- [(txId, chain, symbol, amount)]
   where
-    signatory owner, operator
+    signatory owner
+    observer operator
 
     choice DepositAsset: ContractId CollateralVault
       with
@@ -119,3 +120,11 @@ template CollateralVault
       do
         let totalValue = foldl (\acc pos -> acc + pos.valueUSD) 0.0 collateralAssets
         return (totalValue, length collateralAssets)
+
+    choice CloseVault: ()
+      controller owner
+      do
+        -- Consuming choice: archives this vault contract
+        -- Caller is responsible for withdrawing EVM escrow funds
+        -- and unlocking CollateralLock contracts beforehand
+        return ()

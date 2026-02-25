@@ -15,7 +15,6 @@ template Position
     vaultId: Text
     description: Text
     notionalValue: Decimal
-    collateralValue: Decimal
     currentLTV: Decimal
     status: PositionStatus
     createdAt: Text
@@ -26,19 +25,17 @@ template Position
     units: Optional Decimal
     unrealizedPnL: Optional Decimal
   where
-    signatory fund, operator
-    observer broker
+    signatory fund
+    observer broker, operator
 
     choice UpdateLTV: ContractId Position
       with
-        newCollateralValue: Decimal
         newLTV: Decimal
         checkedAt: Text
         newPnL: Optional Decimal
       controller operator
       do
         create this with
-          collateralValue = newCollateralValue
           currentLTV = newLTV
           unrealizedPnL = newPnL
           lastChecked = checkedAt

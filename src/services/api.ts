@@ -9,10 +9,10 @@ import { getSDK } from '@stratos-wallet/sdk';
 import type { CantonContract } from '@stratos-wallet/sdk';
 import {
   deployEscrowContract, deployDepositRelay,
-  encodeWithdrawETH, encodeWithdrawERC20, encodeLiquidateETH,
+  encodeWithdrawETH, encodeWithdrawERC20, encodeLiquidateETH, encodeLiquidateERC20,
   encodeForwardETH, encodeForwardERC20,
   CHAIN_CONFIG, CHAIN_NAME_TO_ID, CHAIN_ID_TO_NAME,
-  getDefaultChainId, NETWORK_MODE,
+  getDefaultChainId, getNetworkMode, isEVMChain,
 } from './evmEscrow';
 
 // Truncate a number to 10 decimal places for Daml Numeric 10
@@ -23,7 +23,7 @@ function toDecimal10(n: number): string {
 
 // CPCV Package ID (deterministic hash - same across all participant nodes)
 // Must match the DAR file: daml/.daml/dist/cpcv-0.0.1.dar
-const CPCV_PACKAGE_ID = '4a9840c0f6177ff757bdfc1d1c7f90cc2f7510d34d7c974d03c28d2f8eb18f30';
+const CPCV_PACKAGE_ID = '4b60e70f9f90e2164c86529fe91dbacf858a0b0de2498a5366e33120691d09a6';
 
 // Template IDs for PrivaMargin Daml contracts (from cpcv-hackathon)
 // Format: PackageId:ModuleName:TemplateName
@@ -47,6 +47,8 @@ const TEMPLATE_IDS = {
   POSITION: `${CPCV_PACKAGE_ID}:Position:Position`,
   // Workflow margin call
   WORKFLOW_MARGIN_CALL: `${CPCV_PACKAGE_ID}:MarginVerification:WorkflowMarginCall`,
+  // Collateral lock (self-custodied CC pledge)
+  COLLATERAL_LOCK: `${CPCV_PACKAGE_ID}:CollateralLock:CollateralLock`,
 };
 
 // Choice names
@@ -60,6 +62,7 @@ const CHOICES = {
   RECORD_DEPOSIT: 'RecordDeposit',
   GET_VAULT_VALUE: 'GetVaultValue',
   GET_VAULT_INFO: 'GetVaultInfo',
+  CLOSE_VAULT: 'CloseVault',
   // MarginRequirement choices
   VERIFY_MARGIN: 'VerifyMargin',
   TRIGGER_MARGIN_CALL: 'TriggerMarginCall',
@@ -113,6 +116,7 @@ interface Vault {
   linkedPositions: string[];
   chainVaults: Array<{ chain: string; custodyAddress: string }>;
   depositRecords: Array<{ txId: string; chain: string; symbol: string; amount: string }>;
+  chainBalancesBySymbol: Record<string, Record<string, number>>;
   createdAt: string;
 }
 
@@ -127,16 +131,24 @@ interface MarginCall {
 }
 
 interface VerificationResult {
-  positionId: string;
   status: 'Sufficient' | 'Insufficient';
-  proof: string;
+  ltv: number;
+  ltvBps: number;
   timestamp: string;
+  zkProof?: {
+    proof: unknown;
+    publicSignals: string[];
+    proofHash: string;
+    isLiquidatable: boolean;
+    proofTimeMs: number;
+    verified: boolean;
+  };
 }
 
 // Map UI asset type strings to Daml AssetType enum
 // Canton JSON API expects simple string for enums
 function mapAssetTypeToEnum(assetType: string): string {
-  if (assetType === 'USDC' || assetType === 'USDT' || assetType === 'CUSD') {
+  if (assetType === 'USDC' || assetType === 'USDT' || assetType === 'CUSD' || assetType === 'CUSDC') {
     return 'Stablecoin';
   }
   if (assetType === 'CC') {
@@ -157,6 +169,7 @@ const FALLBACK_PRICES: Record<string, number> = {
   'TRX': 0.25,
   'TON': 5.50,
   'CUSD': 1,
+  'CUSDC': 1,
 };
 
 // CoinGecko ID mapping (matches wallet SDK priceService.ts)
@@ -203,6 +216,14 @@ async function fetchLivePrices(): Promise<Record<string, number>> {
     console.warn('Failed to fetch live prices from CoinGecko, using fallback:', err);
   }
   return FALLBACK_PRICES;
+}
+
+// Map internal symbol to user-facing display name (e.g. CUSDC → USDC)
+const DISPLAY_SYMBOLS: Record<string, string> = {
+  'CUSDC': 'USDC (Canton)',
+};
+export function displaySymbol(symbol: string): string {
+  return DISPLAY_SYMBOLS[symbol] || symbol;
 }
 
 // Get live price for a symbol
@@ -252,17 +273,6 @@ export async function getCustodianParty(): Promise<string | null> {
   } catch {
     return null;
   }
-}
-
-// Generate a mock ZK proof
-function generateZKProof(): string {
-  const proofData = {
-    commitment: btoa(Math.random().toString(36)),
-    challenge: btoa(Math.random().toString(36)),
-    response: btoa(Math.random().toString(36)),
-    timestamp: Date.now(),
-  };
-  return btoa(JSON.stringify(proofData));
 }
 
 // Resolve the actual asset symbol from assetId (e.g. "BTC-1706123456789-abc123" → "BTC")
@@ -329,6 +339,26 @@ function contractToVault(contract: CantonContract<Record<string, unknown>>): Vau
     txId: t[0] || '', chain: t[1] || '', symbol: t[2] || '', amount: t[3] || '',
   }));
 
+  // Derive per-chain balances from depositRecords: { symbol → { chain → sum(amount) } }
+  // depositRecords may store Daml enum names ("Stablecoin") or resolved symbols ("USDC"),
+  // so normalize via resolveAssetSymbol to match collateralAssets keys.
+  // Also normalize chain names: 'canton'→'Canton', 'evm'→specific chain if single EVM escrow.
+  const evmChainVaults = chainVaults.filter(cv => isEVMChain(cv.chain));
+  const chainBalancesBySymbol: Record<string, Record<string, number>> = {};
+  for (const dr of depositRecords) {
+    if (!dr.symbol || !dr.chain) continue;
+    const symbol = resolveAssetSymbol(dr.symbol, '');
+    // Normalize chain name to prevent double-counting (e.g. 'evm' + 'Base' for same deposit)
+    let chain = dr.chain;
+    if (chain.toLowerCase() === 'canton') {
+      chain = 'Canton';
+    } else if (chain === 'evm' && evmChainVaults.length === 1) {
+      chain = evmChainVaults[0].chain;
+    }
+    if (!chainBalancesBySymbol[symbol]) chainBalancesBySymbol[symbol] = {};
+    chainBalancesBySymbol[symbol][chain] = (chainBalancesBySymbol[symbol][chain] || 0) + (parseFloat(dr.amount) || 0);
+  }
+
   return {
     vaultId: payload.vaultId as string,
     owner: payload.owner as string,
@@ -337,6 +367,7 @@ function contractToVault(contract: CantonContract<Record<string, unknown>>): Vau
     linkedPositions: (payload.linkedPositions as string[]) || [],
     chainVaults,
     depositRecords,
+    chainBalancesBySymbol,
     createdAt: contract.createdAt || new Date().toISOString(),
   };
 }
@@ -369,6 +400,61 @@ function contractToMarginCall(contract: CantonContract<Record<string, unknown>>)
   };
 }
 
+// Helper: mint a TokenizedAsset and deposit it into a vault (used by sync flow)
+async function mintAndDeposit(
+  vaultId: string, owner: string,
+  symbol: string, amount: number, price: number, chain: string,
+) {
+  if (!sdk) throw new Error('SDK not available');
+
+  const assetId = `${symbol}-sync-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const assetTypeEnum = mapAssetTypeToEnum(symbol);
+  const valueUSD = amount * price;
+
+  // Mint TokenizedAsset via AssetIssuance
+  const issuanceResult = await sdk.cantonCreate({
+    templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+    payload: {
+      issuer: owner,
+      recipient: owner,
+      assetId,
+      assetType: assetTypeEnum,
+      amount: toDecimal10(amount),
+      valueUSD: toDecimal10(valueUSD),
+    },
+  });
+  const acceptResult = await sdk.cantonExercise({
+    contractId: issuanceResult.contractId,
+    templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+    choice: 'Accept',
+    argument: {},
+  });
+  const tokenizedAssetCid = acceptResult.events?.find(
+    (e: { templateId: string }) => e.templateId.includes('TokenizedAsset')
+  )?.contractId;
+  if (!tokenizedAssetCid) throw new Error('Failed to create TokenizedAsset for sync');
+
+  // Deposit into vault (re-query to get fresh contract ID)
+  const vaults = await sdk.cantonQuery({
+    templateId: TEMPLATE_IDS.VAULT,
+    filter: { vaultId },
+  });
+  if (vaults.length === 0) throw new Error('Vault not found for sync deposit');
+
+  await sdk.cantonExercise({
+    contractId: vaults[0].contractId,
+    templateId: TEMPLATE_IDS.VAULT,
+    choice: 'DepositAssetWithTx',
+    argument: {
+      assetCid: tokenizedAssetCid,
+      txId: 'external-deposit',
+      chain,
+    },
+  });
+
+  console.log(`[syncEscrow] Deposited ${amount} ${symbol} from ${chain} into vault ${vaultId}`);
+}
+
 // Vault API
 export const vaultAPI = {
   create: async (owner: string, vaultId: string, initialAssets?: Array<{ assetType: string; amount: number }>) => {
@@ -378,7 +464,7 @@ export const vaultAPI = {
         // Use dedicated custodian party for vault custody; fallback to operator or owner
         const operatorParty = await getCustodianParty() || await getOperatorParty() || owner;
 
-        // Step 1: Create the vault with operator as custodian
+        // Step 1: Create the vault (owner is sole signatory, operator is observer)
         const result = await sdk.cantonCreate({
           templateId: TEMPLATE_IDS.VAULT,
           payload: {
@@ -469,6 +555,7 @@ export const vaultAPI = {
       linkedPositions: [],
       chainVaults: [],
       depositRecords: [],
+      chainBalancesBySymbol: {},
       createdAt: new Date().toISOString(),
     };
     mockVaults.set(vaultId, vault);
@@ -585,8 +672,12 @@ export const vaultAPI = {
   },
 
   // Real deposit: transfers tokens from wallet via SDK, then records in Daml vault
-  depositReal: async (vaultId: string, symbol: string, amount: number, chain: string) => {
+  depositReal: async (vaultId: string, symbol: string, amount: number, chain: string, chainName?: string) => {
     if (!sdk) throw new Error('SDK not available');
+
+    // chain = routing type ('evm', 'canton')
+    // chainName = specific chain name ('Ethereum', 'Base', 'Canton') for the deposit record
+    const recordChain = chainName || chain;
 
     // Query vault first to get owner/operator
     const vaults = await sdk.cantonQuery({
@@ -602,29 +693,47 @@ export const vaultAPI = {
     // If vault has an EVM escrow registered for this chain, send directly to escrow contract
     // Otherwise use Canton custodian party transfer
     const vault = contractToVault(vaultContract);
-    const evmChainNames = ['Ethereum', 'Sepolia', 'Base'];
+    // Match specific chain escrow first, then fall back to any EVM escrow
     const matchingEscrow = vault.chainVaults.find(cv =>
-      evmChainNames.includes(cv.chain) && chain === 'evm'
+      chainName ? cv.chain === chainName : (isEVMChain(cv.chain) && chain === 'evm')
     );
 
     let txId: string | undefined;
     if (matchingEscrow && chain === 'evm') {
-      // EVM path: send native ETH — route through relay if available, else direct to escrow
+      // EVM path: send directly to escrow contract
       const chainId = CHAIN_NAME_TO_ID[matchingEscrow.chain] || getDefaultChainId();
-      const amountWei = '0x' + BigInt(Math.round(amount * 1e18)).toString(16);
-      const chainConfig = CHAIN_CONFIG[chainId];
-      const destination = chainConfig?.relay || matchingEscrow.custodyAddress;
-      const evmResult = await sdk.sendEVMTransaction({
-        transaction: {
-          to: destination,
-          value: amountWei,
-          chainId,
-        },
-      });
-      console.log(chainConfig?.relay ? 'Relay deposit result:' : 'EVM escrow deposit result:', evmResult);
-      txId = evmResult.transactionHash;
+      const isStablecoin = ['USDC', 'USDT'].includes(symbol);
+
+      if (isStablecoin) {
+        // ERC20 deposit: call transfer(escrowAddress, amount) on the token contract
+        const decimals = symbol === 'USDC' || symbol === 'USDT' ? 6 : 18;
+        const tokenAmount = BigInt(Math.round(amount * 10 ** decimals));
+        const chainConfig = CHAIN_CONFIG[chainId];
+        const tokenAddr = chainConfig?.usdc;
+        if (!tokenAddr) throw new Error(`No ${symbol} token address for chain ${chainId}`);
+        // ERC20 transfer(address,uint256) selector: 0xa9059cbb
+        const paddedTo = matchingEscrow.custodyAddress.slice(2).toLowerCase().padStart(64, '0');
+        const paddedAmount = tokenAmount.toString(16).padStart(64, '0');
+        const callData = '0xa9059cbb' + paddedTo + paddedAmount;
+        const evmResult = await sdk.sendContractCall(tokenAddr, callData, chainId);
+        console.log('ERC20 escrow deposit result:', evmResult);
+        txId = evmResult.transactionHash;
+      } else {
+        // Native ETH deposit: send value directly
+        const amountWei = '0x' + BigInt(Math.round(amount * 1e18)).toString(16);
+        const evmResult = await sdk.sendEVMTransaction({
+          transaction: {
+            to: matchingEscrow.custodyAddress,
+            value: amountWei,
+            chainId,
+          },
+        });
+        console.log('EVM escrow deposit result:', evmResult);
+        txId = evmResult.transactionHash;
+      }
     } else {
-      // Canton path: transfer to custodian party
+      // Canton path: transfer CC to custodian + create CollateralLock
+      // Step 1a: Actually move CC to custodian party (real balance transfer)
       const custodianParty = await getCustodianParty() || operator;
       const transferResult = await sdk.transfer({
         to: custodianParty,
@@ -632,8 +741,46 @@ export const vaultAPI = {
         symbol,
         chain: chain as 'canton' | 'evm' | 'svm' | 'btc' | 'tron' | 'ton',
       });
-      console.log('Transfer result:', transferResult);
+      console.log('CC transfer to custodian:', transferResult);
       txId = (transferResult as { txId?: string }).txId;
+
+      // Step 1a.2: Accept the transfer offer on the custodian's behalf
+      // sdk.transfer() creates an offer; the custodian must accept for CC to actually move
+      const transferContractId = (transferResult as { contractId?: string; offer_contract_id?: string }).contractId
+        || (transferResult as { offer_contract_id?: string }).offer_contract_id;
+      try {
+        const acceptRes = await fetch('/api/custodian/accept-deposit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(transferContractId ? { contractId: transferContractId } : {}),
+        });
+        const acceptData = await acceptRes.json();
+        console.log('Custodian accept-deposit result:', acceptData);
+        if (!acceptRes.ok) {
+          console.warn('Custodian accept-deposit failed:', acceptData);
+        }
+      } catch (acceptErr) {
+        console.warn('Custodian accept-deposit error (non-fatal):', acceptErr);
+      }
+
+      // Step 1b: Create CollateralLock on Daml (records the encumbrance, gated release)
+      const lockId = `lock-${vaultId}-${symbol}-${Date.now()}`;
+      const livePricesForLock = await fetchLivePrices();
+      const lockPrice = livePricesForLock[symbol] || FALLBACK_PRICES[symbol] || 1;
+      await sdk.cantonCreate({
+        templateId: TEMPLATE_IDS.COLLATERAL_LOCK,
+        payload: {
+          owner,
+          operator,
+          vaultId,
+          assetType: mapAssetTypeToEnum(symbol),
+          symbol,
+          amount: toDecimal10(amount),
+          valueUSD: toDecimal10(amount * lockPrice),
+          lockId,
+        },
+      });
+      console.log('CollateralLock created for vault', vaultId);
     }
 
     // Step 2: Mint TokenizedAsset on Daml (to record in vault)
@@ -674,7 +821,7 @@ export const vaultAPI = {
       argument: {
         assetCid: tokenizedAssetCid,
         txId: txId || null,
-        chain,
+        chain: recordChain,
       }
     });
 
@@ -783,12 +930,15 @@ export const vaultAPI = {
         if (vaults.length > 0) {
           return { data: await recalcVaultPrices(contractToVault(vaults[0])) };
         }
+        // Vault not found on Canton — don't fall back to mock
+        throw new Error('Vault not found');
       } catch (error) {
+        if (error instanceof Error && error.message === 'Vault not found') throw error;
         console.warn('Canton query failed, using mock:', error);
       }
     }
 
-    // Fallback to mock
+    // Fallback to mock (only when SDK is not available)
     const vault = mockVaults.get(vaultId);
     if (!vault) throw new Error('Vault not found');
     return { data: await recalcVaultPrices(vault) };
@@ -802,10 +952,8 @@ export const vaultAPI = {
           templateId: TEMPLATE_IDS.VAULT,
           filter: { owner: party }
         });
-        if (contracts.length > 0) {
-          const vaults = contracts.map(contractToVault);
-          return { data: await Promise.all(vaults.map(recalcVaultPrices)) };
-        }
+        const vaults = contracts.map(contractToVault);
+        return { data: await Promise.all(vaults.map(recalcVaultPrices)) };
       } catch (error) {
         console.warn('Canton query failed, using mock:', error);
       }
@@ -815,35 +963,62 @@ export const vaultAPI = {
     return { data: await Promise.all(ownerVaults.map(recalcVaultPrices)) };
   },
 
-  // Deploy an EVM escrow contract for a vault and register it on Canton
-  deployEVMEscrow: async (vaultId: string, chainId: number, liquidatorAddress?: string) => {
+  // Deploy an EVM escrow contract for a vault and register it on Canton.
+  // Routes through the server-side deployer (/api/escrow/deploy) so escrow
+  // contracts are deployed from a dedicated platform address for privacy.
+  // Falls back to client-side SDK deploy if the server endpoint is unavailable.
+  deployEVMEscrow: async (vaultId: string, chainId: number, liquidatorAddress?: string, displayChainName?: string) => {
     if (!sdk) throw new Error('SDK not available');
 
-    // Step 1: Resolve liquidator address (default: operator's EVM address)
-    let liquidator = liquidatorAddress;
-    if (!liquidator) {
-      const addresses = await sdk.getAddresses();
-      const evmAddr = addresses.find(a => a.chainType === 'evm');
-      if (evmAddr) {
-        liquidator = evmAddr.address;
+    // Resolve owner (fund party's EVM address)
+    const addresses = await sdk.getAddresses();
+    const evmAddr = addresses.find(a => a.chainType === 'evm');
+    if (!evmAddr) throw new Error('No EVM address found');
+
+    const ownerAddr = evmAddr.address;
+    const liquidator = liquidatorAddress || ownerAddr;
+
+    let contractAddress: string;
+    let txHash: string;
+
+    // Try server-side deployer first (dedicated platform address)
+    try {
+      const deployRes = await fetch('/api/escrow/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chainId, ownerAddress: ownerAddr, liquidatorAddress: liquidator }),
+      });
+      const deployData = await deployRes.json() as {
+        success?: boolean;
+        contractAddress?: string;
+        txHash?: string;
+        error?: string;
+      };
+      if (deployRes.ok && deployData.success && deployData.contractAddress) {
+        contractAddress = deployData.contractAddress;
+        txHash = deployData.txHash || '';
+        console.log('[EVM Escrow] Deployed via server-side deployer:', contractAddress);
       } else {
-        throw new Error('No EVM address found for liquidator');
+        throw new Error(deployData.error || 'Server deploy failed');
       }
+    } catch (serverErr) {
+      // Fallback: deploy from client wallet (user pays gas, traces to their address)
+      console.warn('[EVM Escrow] Server deploy failed, falling back to client-side:', serverErr);
+      const chainConfig = CHAIN_CONFIG[chainId];
+      if (!chainConfig) throw new Error(`Unsupported chain ${chainId} — no Uniswap V3 config available`);
+      const result = await deployEscrowContract(sdk, chainId, ownerAddr, liquidator, chainConfig.swapRouter, chainConfig.weth, chainConfig.usdc);
+      contractAddress = result.contractAddress;
+      txHash = result.txHash;
     }
 
-    // Step 2: Deploy escrow contract on EVM chain (with Uniswap V3 swap config)
-    const chainConfig = CHAIN_CONFIG[chainId];
-    if (!chainConfig) throw new Error(`Unsupported chain ${chainId} — no Uniswap V3 config available`);
-    const { contractAddress, txHash } = await deployEscrowContract(sdk, chainId, liquidator, chainConfig.swapRouter, chainConfig.weth, chainConfig.usdc);
-
-    // Step 2: Register the escrow address on the Daml vault via RegisterChainVault
+    // Register the escrow address on the Daml vault via RegisterChainVault
     const vaults = await sdk.cantonQuery({
       templateId: TEMPLATE_IDS.VAULT,
       filter: { vaultId }
     });
     if (vaults.length === 0) throw new Error('Vault not found');
 
-    const chainName = CHAIN_ID_TO_NAME[chainId] || `EVM-${chainId}`;
+    const chainName = displayChainName || CHAIN_ID_TO_NAME[chainId] || `EVM-${chainId}`;
 
     await sdk.cantonExercise({
       contractId: vaults[0].contractId,
@@ -868,7 +1043,7 @@ export const vaultAPI = {
   },
 
   // Withdraw ETH or ERC20 from a vault's escrow contract
-  withdrawFromEscrow: async (vaultId: string, chain: string, amountWei: string, tokenAddress?: string) => {
+  withdrawFromEscrow: async (vaultId: string, chain: string, amountWei: string, tokenAddress?: string, symbol?: string) => {
     if (!sdk) throw new Error('SDK not available');
 
     // Get vault to find escrow address and user's EVM address
@@ -878,6 +1053,7 @@ export const vaultAPI = {
     });
     if (vaults.length === 0) throw new Error('Vault not found');
     const vault = contractToVault(vaults[0]);
+    const owner = (vaults[0].payload as Record<string, unknown>).owner as string;
 
     const chainVault = vault.chainVaults.find(cv => cv.chain === chain);
     if (!chainVault) throw new Error(`No escrow registered for chain: ${chain}`);
@@ -900,7 +1076,314 @@ export const vaultAPI = {
     }
 
     const result = await sdk.sendContractCall(escrowAddress, callData, chainId);
+
+    // Also remove matching asset entries from the Daml vault record.
+    // Use RAW entries (not aggregated) to correctly handle multiple deposits.
+    const withdrawSymbol = symbol || (tokenAddress ? 'USDC' : 'ETH');
+    const isStable = ['USDC', 'USDT'].includes(withdrawSymbol);
+    const withdrawDecimals = isStable ? 6 : 18;
+    const withdrawAmount = Number(BigInt(amountWei)) / (10 ** withdrawDecimals);
+    const rawAssets = (vaults[0].payload as Record<string, unknown>).collateralAssets as Array<Record<string, unknown>> || [];
+    const rawMatching = rawAssets
+      .filter(a => resolveAssetSymbol(a.assetType as string, a.assetId as string) === withdrawSymbol)
+      .map(a => ({
+        assetId: a.assetId as string,
+        amount: typeof a.amount === 'string' ? parseFloat(a.amount) : (a.amount as number) || 0,
+      }))
+      .sort((a, b) => a.amount - b.amount); // smallest first, greedily consume
+
+    let damlRemaining = withdrawAmount;
+    for (const entry of rawMatching) {
+      if (damlRemaining <= 0.001) break;
+      try {
+        const freshVaults = await sdk.cantonQuery({
+          templateId: TEMPLATE_IDS.VAULT,
+          filter: { vaultId }
+        });
+        if (freshVaults.length === 0) break;
+
+        await sdk.cantonExercise({
+          contractId: freshVaults[0].contractId,
+          templateId: TEMPLATE_IDS.VAULT,
+          choice: CHOICES.WITHDRAW_ASSET,
+          argument: { assetId: entry.assetId, issuer: owner }
+        });
+
+        // Re-deposit excess if this entry was larger than what we need
+        if (entry.amount > damlRemaining + 0.001) {
+          const excess = entry.amount - damlRemaining;
+          const price = await getLivePrice(withdrawSymbol);
+          const newAssetId = `${withdrawSymbol}-esc-remainder-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          const issuanceResult = await sdk.cantonCreate({
+            templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+            payload: {
+              issuer: owner, recipient: owner,
+              assetId: newAssetId, assetType: mapAssetTypeToEnum(withdrawSymbol),
+              amount: toDecimal10(excess),
+              valueUSD: toDecimal10(excess * price),
+            },
+          });
+          const acceptResult = await sdk.cantonExercise({
+            contractId: issuanceResult.contractId,
+            templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+            choice: 'Accept',
+            argument: {},
+          });
+          const tokenCid = acceptResult.events?.find(
+            (e: { templateId: string }) => e.templateId.includes('TokenizedAsset')
+          )?.contractId;
+          if (tokenCid) {
+            const reVaults = await sdk.cantonQuery({
+              templateId: TEMPLATE_IDS.VAULT,
+              filter: { vaultId },
+            });
+            if (reVaults.length > 0) {
+              await sdk.cantonExercise({
+                contractId: reVaults[0].contractId,
+                templateId: TEMPLATE_IDS.VAULT,
+                choice: CHOICES.DEPOSIT_ASSET,
+                argument: { assetCid: tokenCid },
+              });
+            }
+          }
+        }
+
+        damlRemaining -= entry.amount;
+      } catch (err) {
+        console.warn(`[withdrawFromEscrow] Daml entry removal failed for ${entry.assetId}:`, err);
+      }
+    }
+
     return { data: { txHash: result.transactionHash, status: result.status } };
+  },
+
+  // Withdraw a Canton-native asset (CC, CUSDC, or Canton USDC) from the vault back to the owner
+  // Works with INDIVIDUAL Daml entries (not the aggregated view) to correctly handle
+  // multiple deposits of the same asset type.
+  withdrawCantonAsset: async (vaultId: string, symbol: string, amount: number) => {
+    if (!sdk) throw new Error('SDK not available');
+
+    const vaults = await sdk.cantonQuery({
+      templateId: TEMPLATE_IDS.VAULT,
+      filter: { vaultId }
+    });
+    if (vaults.length === 0) throw new Error('Vault not found');
+
+    const owner = (vaults[0].payload as Record<string, unknown>).owner as string;
+
+    // Get the RAW (non-aggregated) asset entries from the Daml contract
+    const rawAssets = (vaults[0].payload as Record<string, unknown>).collateralAssets as Array<Record<string, unknown>> || [];
+    const matchingEntries = rawAssets
+      .filter(a => resolveAssetSymbol(a.assetType as string, a.assetId as string) === symbol)
+      .map(a => ({
+        assetId: a.assetId as string,
+        amount: typeof a.amount === 'string' ? parseFloat(a.amount) : (a.amount as number) || 0,
+      }))
+      .sort((a, b) => b.amount - a.amount); // largest first
+
+    const totalAvailable = matchingEntries.reduce((sum, e) => sum + e.amount, 0);
+    if (amount > totalAvailable + 0.001) {
+      throw new Error(`Requested ${amount} ${symbol} but vault only has ${totalAvailable}`);
+    }
+
+    // Step 1: Withdraw individual entries from the Daml vault to cover the requested amount.
+    // Each WithdrawAsset removes one entry (all-or-nothing per assetId).
+    // If we split a partial entry, we re-deposit the remainder.
+    let remaining = amount;
+    for (const entry of matchingEntries) {
+      if (remaining <= 0.001) break;
+
+      // Re-query vault each iteration (contractId changes after each WithdrawAsset)
+      const freshVaults = await sdk.cantonQuery({
+        templateId: TEMPLATE_IDS.VAULT,
+        filter: { vaultId },
+      });
+      if (freshVaults.length === 0) break;
+
+      await sdk.cantonExercise({
+        contractId: freshVaults[0].contractId,
+        templateId: TEMPLATE_IDS.VAULT,
+        choice: CHOICES.WITHDRAW_ASSET,
+        argument: { assetId: entry.assetId, issuer: owner }
+      });
+      console.log(`[Canton Withdraw] Removed entry ${entry.assetId}: ${entry.amount} ${symbol}`);
+
+      if (entry.amount > remaining + 0.001) {
+        // Partial: re-deposit the excess back into the vault
+        const excess = entry.amount - remaining;
+        const price = await getLivePrice(symbol);
+        try {
+          const newAssetId = `${symbol}-remainder-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          const issuanceResult = await sdk.cantonCreate({
+            templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+            payload: {
+              issuer: owner, recipient: owner,
+              assetId: newAssetId, assetType: mapAssetTypeToEnum(symbol),
+              amount: toDecimal10(excess),
+              valueUSD: toDecimal10(excess * price),
+            },
+          });
+          const acceptResult = await sdk.cantonExercise({
+            contractId: issuanceResult.contractId,
+            templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+            choice: 'Accept',
+            argument: {},
+          });
+          const tokenCid = acceptResult.events?.find(
+            (e: { templateId: string }) => e.templateId.includes('TokenizedAsset')
+          )?.contractId;
+          if (tokenCid) {
+            const reVaults = await sdk.cantonQuery({
+              templateId: TEMPLATE_IDS.VAULT,
+              filter: { vaultId },
+            });
+            if (reVaults.length > 0) {
+              await sdk.cantonExercise({
+                contractId: reVaults[0].contractId,
+                templateId: TEMPLATE_IDS.VAULT,
+                choice: CHOICES.DEPOSIT_ASSET,
+                argument: { assetCid: tokenCid },
+              });
+              console.log(`[Canton Withdraw] Re-deposited excess: ${excess.toFixed(4)} ${symbol}`);
+            }
+          }
+        } catch (err) {
+          console.warn('[Canton Withdraw] Excess re-deposit failed:', err);
+        }
+      }
+
+      remaining -= entry.amount;
+    }
+
+    // Step 2: Transfer the requested amount from custodian back to user
+    if (symbol === 'CC' || symbol === 'CUSDC') {
+      try {
+        const withdrawRes = await fetch('/api/custodian/withdraw', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ receiverParty: owner, amount }),
+        });
+        const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
+        if (!withdrawRes.ok || !withdrawData.success) {
+          console.warn(`[${symbol} Withdraw] Custodian transfer failed:`, withdrawData.error);
+        } else {
+          console.log(`[${symbol} Withdraw] Custodian transfer of ${amount} ${symbol} created`);
+        }
+      } catch (err) {
+        console.warn(`[${symbol} Withdraw] Custodian endpoint error:`, err);
+      }
+    } else if (symbol === 'USDC') {
+      try {
+        const withdrawRes = await fetch('/api/custodian/withdraw-usdc', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ receiverParty: owner, amount }),
+        });
+        const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
+        if (!withdrawRes.ok || !withdrawData.success) {
+          console.warn('[USDC Withdraw] Canton USDC transfer failed:', withdrawData.error);
+        } else {
+          console.log(`[USDC Withdraw] Canton USDC transfer of ${amount} USDC created`);
+        }
+      } catch (err) {
+        console.warn('[USDC Withdraw] Canton USDC endpoint error:', err);
+      }
+    }
+
+    return { success: true };
+  },
+
+  // Close a vault — archive the Daml contract
+  closeVault: async (vaultId: string) => {
+    if (!sdk) throw new Error('SDK not available');
+
+    const vaults = await sdk.cantonQuery({
+      templateId: TEMPLATE_IDS.VAULT,
+      filter: { vaultId }
+    });
+    if (vaults.length === 0) throw new Error('Vault not found');
+
+    await sdk.cantonExercise({
+      contractId: vaults[0].contractId,
+      templateId: TEMPLATE_IDS.VAULT,
+      choice: CHOICES.CLOSE_VAULT,
+      argument: {}
+    });
+
+    return { success: true };
+  },
+
+  // Sync on-chain escrow balances with Daml-tracked collateral.
+  // Detects external deposits (e.g. USDC sent directly to escrow address)
+  // and mints TokenizedAssets + deposits them into the vault.
+  syncEscrowDeposits: async (vaultId: string) => {
+    if (!sdk) throw new Error('SDK not available');
+
+    const vaults = await sdk.cantonQuery({
+      templateId: TEMPLATE_IDS.VAULT,
+      filter: { vaultId }
+    });
+    if (vaults.length === 0) throw new Error('Vault not found');
+
+    const vaultContract = vaults[0];
+    const vault = contractToVault(vaultContract);
+    const owner = (vaultContract.payload as Record<string, unknown>).owner as string;
+
+    if (!vault.chainVaults?.length) return { data: vault, synced: [] };
+
+    const synced: Array<{ chain: string; symbol: string; amount: number }> = [];
+    const livePrices = await fetchLivePrices();
+
+    for (const cv of vault.chainVaults) {
+      const chainId = CHAIN_NAME_TO_ID[cv.chain];
+      if (!chainId) continue;
+
+      // Read on-chain balances via server-side function
+      try {
+        const balRes = await fetch(`/api/escrow/balances?address=${cv.custodyAddress}&chainId=${chainId}`);
+        if (!balRes.ok) continue;
+        const bal = await balRes.json() as {
+          eth: string; usdc: string;
+          ethFormatted: string; usdcFormatted: string;
+        };
+
+        // Use per-chain tracked balances from depositRecords (not total across all chains)
+        // to correctly handle multi-chain vaults (Ethereum + Base each with their own assets)
+        const trackedEthOnChain = vault.chainBalancesBySymbol?.['ETH']?.[cv.chain] || 0;
+        const trackedUsdcOnChain = vault.chainBalancesBySymbol?.['USDC']?.[cv.chain] || 0;
+
+        // Check ETH balance
+        const onChainEth = parseFloat(bal.ethFormatted);
+        if (onChainEth > trackedEthOnChain + 0.0001) {
+          const diff = onChainEth - trackedEthOnChain;
+          const price = livePrices['ETH'] || FALLBACK_PRICES['ETH'] || 2000;
+          await mintAndDeposit(vaultId, owner, 'ETH', diff, price, cv.chain);
+          synced.push({ chain: cv.chain, symbol: 'ETH', amount: diff });
+        }
+
+        // Check USDC balance
+        const onChainUsdc = parseFloat(bal.usdcFormatted);
+        if (onChainUsdc > trackedUsdcOnChain + 0.01) {
+          const diff = onChainUsdc - trackedUsdcOnChain;
+          const price = livePrices['USDC'] || FALLBACK_PRICES['USDC'] || 1;
+          await mintAndDeposit(vaultId, owner, 'USDC', diff, price, cv.chain);
+          synced.push({ chain: cv.chain, symbol: 'USDC', amount: diff });
+        }
+      } catch (err) {
+        console.warn(`[syncEscrow] Failed to read balances for ${cv.chain}:`, err);
+      }
+    }
+
+    // Return updated vault
+    const updatedVaults = await sdk.cantonQuery({
+      templateId: TEMPLATE_IDS.VAULT,
+      filter: { vaultId }
+    });
+    const updatedVault = updatedVaults.length > 0
+      ? await recalcVaultPrices(contractToVault(updatedVaults[0]))
+      : vault;
+
+    return { data: updatedVault, synced };
   },
 
   // Deploy a DepositRelay contract for a chain (operator only, one per chain)
@@ -984,45 +1467,62 @@ loadRelayAddresses();
 
 // Margin API
 export const marginAPI = {
-  verify: async (positionId: string, _vaultId: string, requiredMargin: number, collateralValue: number) => {
+  verify: async (
+    vaultId: string,
+    requiredMargin: number,
+    collateralValue: number,
+    ltvThreshold?: number,
+    assetValues?: number[],
+  ) => {
+    const ltv = collateralValue > 0 ? requiredMargin / collateralValue : (requiredMargin > 0 ? 999 : 0);
     const status = collateralValue >= requiredMargin ? 'Sufficient' : 'Insufficient';
-    const proof = generateZKProof();
 
     const result: VerificationResult = {
-      positionId,
       status,
-      proof,
+      ltv,
+      ltvBps: Math.round(ltv * 10000),
       timestamp: new Date().toISOString(),
     };
 
-    // Note: Creating MarginCall directly requires all signatories (provider, counterparty, operator)
-    // In a real system, this would go through a proper workflow. For demo, we skip Canton creation
-    // and just use mock data since multi-party contract creation requires coordination.
-    if (status === 'Insufficient') {
-      console.log('Margin insufficient - mock margin call created (Canton multi-party contracts require workflow)');
+    // Generate real ZK proof when asset values are provided
+    if (assetValues && assetValues.length > 0) {
+      try {
+        const { generateLTVProof, verifyLTVProof, proofHash, usdToCents, ltvToBps, isZKAvailable } =
+          await import('./zkProof');
+
+        if (await isZKAvailable()) {
+          const threshold = ltvThreshold ?? 0.8;
+          const zkResult = await generateLTVProof({
+            assetValuesCents: assetValues.map(usdToCents),
+            notionalValueCents: usdToCents(requiredMargin),
+            ltvThresholdBps: ltvToBps(threshold),
+          });
+
+          const verified = await verifyLTVProof(zkResult.proof, zkResult.publicSignals);
+          const hash = await proofHash(zkResult.proof);
+
+          result.ltvBps = zkResult.computedLTVBps;
+          result.ltv = zkResult.computedLTVBps / 10000;
+          result.zkProof = {
+            proof: zkResult.proof,
+            publicSignals: zkResult.publicSignals,
+            proofHash: hash,
+            isLiquidatable: zkResult.isLiquidatable,
+            proofTimeMs: zkResult.proofTimeMs,
+            verified,
+          };
+        }
+      } catch (err) {
+        console.warn('ZK proof generation failed, using plain LTV:', err);
+      }
     }
 
-    mockVerifications.set(positionId, result);
-
-    // If insufficient, create a margin call (mock)
-    if (status === 'Insufficient') {
-      const marginCall: MarginCall = {
-        id: `MC-${Date.now()}`,
-        positionId,
-        requiredAmount: requiredMargin - collateralValue,
-        provider: 'Current User',
-        counterparty: 'Counterparty',
-        status: 'Active',
-        createdAt: new Date().toISOString(),
-      };
-      mockMarginCalls.set(marginCall.id, marginCall);
-    }
-
+    mockVerifications.set(vaultId, result);
     return { data: result };
   },
 
-  getStatus: async (positionId: string) => {
-    const result = mockVerifications.get(positionId);
+  getStatus: async (vaultId: string) => {
+    const result = mockVerifications.get(vaultId);
     return { data: result || null };
   },
 
@@ -1125,6 +1625,7 @@ export const assetAPI = {
       { type: 'TRX', name: 'Tron', category: 'Crypto' },
       { type: 'TON', name: 'Toncoin', category: 'Crypto' },
       { type: 'CUSD', name: 'CUSD', category: 'Stablecoin' },
+      { type: 'CUSDC', name: 'USDC (Canton)', category: 'Stablecoin' },
     ];
     return { data: defaults };
   },
@@ -1805,6 +2306,39 @@ export interface PositionData {
   lastChecked: string;
 }
 
+export interface LiquidationRecord {
+  positionId: string;
+  liquidatedAt: string;
+  liquidationAmountUSD: number;
+  pnl: number;
+  collateralValueAtLiquidation: number;
+  ltvAtLiquidation: number;
+  ltvThreshold: number;
+  escrowLiquidations: Array<{
+    chain: string;
+    custodyAddress: string;
+    ethSeized: string;
+    ethValueUSD: number;
+    usdcSeized: string;
+    txHashes: string[];
+  }>;
+  ccSeized: Array<{
+    symbol: string;
+    amount: number;
+    valueUSD: number;
+  }>;
+  cantonSettlement: Array<{
+    symbol: string;
+    amount: number;
+    valueUSD: number;
+    source: 'bridge' | 'direct';
+  }>;
+  brokerRecipient: string;
+  brokerCantonParty: string;
+}
+
+const liquidationRecords = new Map<string, LiquidationRecord>();
+
 function parseDecimal(v: unknown): number {
   if (typeof v === 'string') return parseFloat(v) || 0;
   return (v as number) || 0;
@@ -1829,12 +2363,67 @@ function contractToPosition(c: CantonContract<Record<string, unknown>>): Positio
     entryPrice: parseDecimal(p.entryPrice),
     units: parseDecimal(p.units),
     unrealizedPnL: parseDecimal(p.unrealizedPnL),
-    collateralValue: parseDecimal(p.collateralValue),
+    collateralValue: 0,
     currentLTV: parseDecimal(p.currentLTV),
     status: p.status as string,
     createdAt: p.createdAt as string,
     lastChecked: p.lastChecked as string,
   };
+}
+
+// Recalculate position collateralValue, PnL, and LTV with live prices.
+// Fetches each unique vault once, reprices, then aggregates across positions sharing a vault.
+async function recalcPositionsLive(positions: PositionData[]): Promise<PositionData[]> {
+  if (positions.length === 0 || !sdk) return positions;
+
+  const prices = await fetchLivePrices();
+
+  // Fetch unique vaults and recalc their value
+  const uniqueVaultIds = [...new Set(positions.map(p => p.vaultId))];
+  const vaultValues: Record<string, number> = {};
+  for (const vid of uniqueVaultIds) {
+    try {
+      const vaults = await sdk.cantonQuery({ templateId: TEMPLATE_IDS.VAULT, filter: { vaultId: vid } });
+      if (vaults.length > 0) {
+        const vault = await recalcVaultPrices(contractToVault(vaults[0]));
+        vaultValues[vid] = vault.totalValue;
+      }
+    } catch { /* use 0 */ }
+  }
+
+  // Compute per-position PnL
+  const withPnL = positions.map(pos => {
+    const entryPrice = pos.entryPrice || 0;
+    const units = pos.units || 0;
+    const symbol = pos.description.trim().split(/\s+/).pop() || '';
+    const currentPrice = prices[symbol] || 0;
+    let pnl = 0;
+    if (entryPrice && units && currentPrice) {
+      pnl = pos.direction === 'Short'
+        ? units * (entryPrice - currentPrice)
+        : units * (currentPrice - entryPrice);
+    }
+    return { ...pos, unrealizedPnL: pnl };
+  });
+
+  // Aggregate notional + PnL per vault (open/margin-called only)
+  const vaultAgg: Record<string, { totalNotional: number; totalPnL: number }> = {};
+  for (const pos of withPnL) {
+    if (pos.status !== 'Open' && pos.status !== 'MarginCalled') continue;
+    if (!vaultAgg[pos.vaultId]) vaultAgg[pos.vaultId] = { totalNotional: 0, totalPnL: 0 };
+    vaultAgg[pos.vaultId].totalNotional += pos.notionalValue;
+    vaultAgg[pos.vaultId].totalPnL += pos.unrealizedPnL;
+  }
+
+  // Recalc collateralValue and LTV
+  return withPnL.map(pos => {
+    const collateral = vaultValues[pos.vaultId] || 0;
+    const agg = vaultAgg[pos.vaultId];
+    const effectiveCollateral = collateral + (agg?.totalPnL || 0);
+    const totalNotional = agg?.totalNotional || pos.notionalValue;
+    const ltv = effectiveCollateral > 0 ? totalNotional / effectiveCollateral : (totalNotional > 0 ? 999 : 0);
+    return { ...pos, collateralValue: collateral, currentLTV: ltv };
+  });
 }
 
 export const positionAPI = {
@@ -1866,7 +2455,26 @@ export const positionAPI = {
           // Use 0 if vault query fails
         }
 
-        const currentLTV = collateralValue > 0 ? notionalValue / collateralValue : 0;
+        // Sum existing open positions' notional on this vault for aggregate LTV
+        let existingNotional = 0;
+        try {
+          const existingPositions = await sdk.cantonQuery({
+            templateId: TEMPLATE_IDS.POSITION,
+            filter: { vaultId },
+          });
+          for (const ep of existingPositions) {
+            const payload = ep.payload as Record<string, unknown>;
+            const status = payload.status as string;
+            if (status === 'Open' || status === 'MarginCalled') {
+              existingNotional += parseDecimal(payload.notionalValue);
+            }
+          }
+        } catch {
+          // ignore — worst case we under-count
+        }
+
+        const totalNotional = existingNotional + notionalValue;
+        const currentLTV = collateralValue > 0 ? totalNotional / collateralValue : 0;
         const positionId = `POS-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
         const now = new Date().toISOString();
 
@@ -1886,7 +2494,6 @@ export const positionAPI = {
             entryPrice: entryPrice > 0 ? toDecimal10(entryPrice) : null,
             units: units > 0 ? toDecimal10(units) : null,
             unrealizedPnL: toDecimal10(0),
-            collateralValue: toDecimal10(collateralValue),
             currentLTV: toDecimal10(currentLTV),
             status: 'Open',
             createdAt: now,
@@ -1909,7 +2516,8 @@ export const positionAPI = {
           templateId: TEMPLATE_IDS.POSITION,
           filter: { fund },
         });
-        return { data: contracts.map(contractToPosition) };
+        const positions = contracts.map(contractToPosition);
+        return { data: await recalcPositionsLive(positions) };
       } catch (error) {
         console.warn('Canton query positions failed:', error);
       }
@@ -1924,7 +2532,8 @@ export const positionAPI = {
           templateId: TEMPLATE_IDS.POSITION,
           filter: { broker },
         });
-        return { data: contracts.map(contractToPosition) };
+        const positions = contracts.map(contractToPosition);
+        return { data: await recalcPositionsLive(positions) };
       } catch (error) {
         console.warn('Canton query positions failed:', error);
       }
@@ -1983,54 +2592,503 @@ export const positionAPI = {
       throw new Error(`LTV ${(pos.currentLTV * 100).toFixed(1)}% is below threshold ${(ltvThreshold * 100).toFixed(0)}%, cannot liquidate`);
     }
 
-    // 5. Calculate liquidation amount = min(notionalValue, collateralValue)
-    const liquidationAmountUSD = Math.min(pos.notionalValue, pos.collateralValue);
-
-    // 6. Look up vault's EVM escrow → escrow address + chain
+    // 5. Look up vault and compute live collateral value
     const vaults = await sdk.cantonQuery({
       templateId: TEMPLATE_IDS.VAULT,
       filter: { vaultId: pos.vaultId },
     });
-    let escrowTxHash: string | undefined;
-
+    let liveCollateralValue = 0;
     if (vaults.length > 0) {
-      const vault = contractToVault(vaults[0]);
-      const evmChainNames = ['Ethereum', 'Sepolia', 'Base'];
-      const escrow = vault.chainVaults.find(cv => evmChainNames.includes(cv.chain));
-
-      if (escrow) {
-        // 7. Convert liquidationAmount (USD) to ETH using live price
-        const ethPrice = await getLivePrice('ETH');
-        const liquidationETH = liquidationAmountUSD / ethPrice;
-        const amountWei = BigInt(Math.round(liquidationETH * 1e18));
-
-        // 8. Get broker's EVM address (destination for liquidated funds)
-        const addresses = await sdk.getAddresses();
-        const brokerEvmAddr = addresses.find(a => a.chainType === 'evm');
-        if (!brokerEvmAddr) throw new Error('No EVM address found for broker');
-
-        // 9. Encode liquidate(brokerEvmAddress, amountWei, amountOutMin)
-        //    Mainnet: 98% of expected USDC (2% slippage tolerance, USDC has 6 decimals)
-        //    Testnet: 0 (Sepolia Uniswap pools have minimal liquidity)
-        const amountOutMin = NETWORK_MODE === 'testnet'
-          ? BigInt(0)
-          : BigInt(Math.round(liquidationAmountUSD * 0.98 * 1e6));
-        const callData = encodeLiquidateETH(brokerEvmAddr.address, amountWei, amountOutMin);
-
-        // 10. Send tx via sendContractCall
-        const chainId = CHAIN_NAME_TO_ID[escrow.chain] || getDefaultChainId();
-
-        try {
-          const txResult = await sdk.sendContractCall(escrow.custodyAddress, callData, chainId);
-          escrowTxHash = txResult.transactionHash;
-          console.log('[Liquidation] EVM tx sent:', escrowTxHash);
-        } catch (err) {
-          console.warn('[Liquidation] EVM tx failed (continuing with Daml update):', err);
-        }
-      }
+      const vaultLive = await recalcVaultPrices(contractToVault(vaults[0]));
+      liveCollateralValue = vaultLive.totalValue;
     }
 
+    // 6. Calculate liquidation amount based on PnL
+    //    - Negative PnL = fund lost money → broker seizes |PnL| from collateral
+    //    - Positive PnL = fund is winning → no collateral seizure (just close position)
+    //    - Cap at vault's live collateral value (can't seize more than what's in the vault)
+    const pnl = pos.unrealizedPnL || 0;
+    const liquidationAmountUSD = pnl < 0
+      ? Math.min(Math.abs(pnl), liveCollateralValue)
+      : 0;
+
+    // Prepare liquidation record tracking
+    const escrowLiquidations: LiquidationRecord['escrowLiquidations'] = [];
+    const ccSeized: LiquidationRecord['ccSeized'] = [];
+    const cantonSettlement: LiquidationRecord['cantonSettlement'] = [];
+    let brokerRecipient = '';
+    let brokerCantonParty = pos.broker || '';
+    const liquidatedAt = new Date().toISOString();
+    const escrowTxHashes: string[] = [];
+
+    // Only perform seizure if there is an amount owed AND vault exists
+    if (liquidationAmountUSD > 0 && vaults.length > 0) {
+      const vault = contractToVault(vaults[0]);
+      const owner = (vaults[0].payload as Record<string, unknown>).owner as string;
+      const evmEscrows = vault.chainVaults.filter(cv => isEVMChain(cv.chain));
+      const ccAssets = vault.collateralAssets.filter(a => a.assetType === 'CC');
+      const cusdcAssets = vault.collateralAssets.filter(a => a.assetType === 'CUSDC');
+      // Canton USDC: USDC deposited via Canton (not in EVM escrow)
+      const cantonUsdcBal = vault.chainBalancesBySymbol?.['USDC']?.['Canton'] || vault.chainBalancesBySymbol?.['USDC']?.['canton'] || 0;
+      const cantonUsdcAssets = cantonUsdcBal > 0
+        ? vault.collateralAssets.filter(a => a.assetType === 'USDC').slice(0, 1)
+        : [];
+
+      // Get operator/deployer EVM address (bridge recipient for EVM→Canton)
+      let operatorEvmAddr: string | undefined;
+      // Get broker's EVM address (fallback destination info)
+      let brokerEvmAddr: { address: string } | undefined;
+      if (evmEscrows.length > 0) {
+        const addresses = await sdk.getAddresses();
+        brokerEvmAddr = addresses.find(a => a.chainType === 'evm');
+        if (!brokerEvmAddr) throw new Error('No EVM address found for broker');
+        brokerRecipient = brokerEvmAddr.address;
+        // Fetch operator/deployer address as bridge recipient
+        try {
+          const deployRes = await fetch('/api/escrow/deploy');
+          const deployData = await deployRes.json() as { deployerAddress?: string };
+          operatorEvmAddr = deployData.deployerAddress;
+        } catch {
+          // Fallback: use broker address if deployer unavailable
+        }
+      }
+
+      // ── Phase 1: Inventory ──────────────────────────────────────────
+      // Read all available balances before seizing anything.
+      // Priority order: USDC (1:1, no slippage) → CC → ETH (volatile, swap slippage)
+      type SeizableAsset = {
+        type: 'USDC' | 'ETH' | 'CC' | 'CUSDC' | 'USDC_CANTON';
+        priority: number;
+        chain?: string;
+        chainId?: number;
+        escrowAddress?: string;
+        balanceWei?: bigint;
+        balanceNum?: number;
+        valueUSD: number;
+        price: number;
+        assetId?: string;
+        usdcTokenAddress?: string;
+      };
+      const inventory: SeizableAsset[] = [];
+      const ethPrice = await getLivePrice('ETH');
+      const ccPrice = await getLivePrice('CC');
+
+      // EVM escrows: read on-chain ETH + USDC balances
+      for (const escrow of evmEscrows) {
+        const chainId = CHAIN_NAME_TO_ID[escrow.chain] || getDefaultChainId();
+        const chainConfig = CHAIN_CONFIG[chainId];
+        try {
+          const balRes = await fetch(`/api/escrow/balances?addresses=${escrow.custodyAddress}&chainIds=${chainId}`);
+          const balData = await balRes.json() as { balances?: Array<{ eth: string; usdc: string }> };
+          const bal = balData.balances?.[0];
+
+          // USDC inventory
+          const usdcBal = BigInt(bal?.usdc || '0');
+          if (usdcBal > BigInt(0) && chainConfig?.usdc) {
+            inventory.push({
+              type: 'USDC', priority: 0,
+              chain: escrow.chain, chainId, escrowAddress: escrow.custodyAddress,
+              balanceWei: usdcBal,
+              valueUSD: Number(usdcBal) / 1e6, // USDC = 6 decimals, 1:1 USD
+              price: 1,
+              usdcTokenAddress: chainConfig.usdc,
+            });
+          }
+
+          // ETH inventory (priority 3 — last resort, requires swap)
+          const ethBal = BigInt(bal?.eth || '0');
+          if (ethBal > BigInt(0)) {
+            inventory.push({
+              type: 'ETH', priority: 3,
+              chain: escrow.chain, chainId, escrowAddress: escrow.custodyAddress,
+              balanceWei: ethBal,
+              valueUSD: Number(ethBal) / 1e18 * ethPrice,
+              price: ethPrice,
+            });
+          }
+        } catch (err) {
+          console.warn(`[Liquidation] Balance read failed for ${escrow.chain}:`, err);
+        }
+      }
+
+      // CUSDC inventory (priority 1 — Canton-native stablecoin, 1:1 USD)
+      for (const cusdcAsset of cusdcAssets) {
+        inventory.push({
+          type: 'CUSDC', priority: 1,
+          balanceNum: cusdcAsset.amount,
+          valueUSD: cusdcAsset.amount, // 1:1 USD
+          price: 1,
+          assetId: cusdcAsset.assetId,
+        });
+      }
+
+      // Canton USDC inventory (priority 0.5 — stablecoin, 1:1 USD, no EVM gas)
+      for (const usdcAsset of cantonUsdcAssets) {
+        inventory.push({
+          type: 'USDC_CANTON', priority: 0,
+          balanceNum: Math.min(usdcAsset.amount, cantonUsdcBal),
+          valueUSD: Math.min(usdcAsset.amount, cantonUsdcBal), // 1:1 USD
+          price: 1,
+          assetId: usdcAsset.assetId,
+        });
+      }
+
+      // CC inventory (priority 2)
+      for (const ccAsset of ccAssets) {
+        const value = ccAsset.amount * ccPrice;
+        inventory.push({
+          type: 'CC', priority: 2,
+          balanceNum: ccAsset.amount,
+          valueUSD: value,
+          price: ccPrice,
+          assetId: ccAsset.assetId,
+        });
+      }
+
+      // Sort by priority: USDC_CANTON/USDC (0) → CUSDC (1) → CC (2) → ETH (3)
+      inventory.sort((a, b) => a.priority - b.priority);
+
+      // ── Phase 2: Plan ───────────────────────────────────────────────
+      // Walk inventory and compute how much of each asset to seize.
+      type SeizurePlan = SeizableAsset & { seizeUSD: number; seizeWei?: bigint; seizeNum?: number };
+      const seizurePlan: SeizurePlan[] = [];
+      let remainingDebt = liquidationAmountUSD;
+
+      for (const asset of inventory) {
+        if (remainingDebt <= 0) break;
+        const seizeUSD = Math.min(asset.valueUSD, remainingDebt);
+
+        if (asset.type === 'USDC_CANTON') {
+          // Canton USDC: decimal amount, 1:1 USD (same as CUSDC handling)
+          const seizeNum = seizeUSD >= asset.valueUSD
+            ? asset.balanceNum!
+            : seizeUSD / asset.price;
+          seizurePlan.push({ ...asset, seizeUSD, seizeNum });
+        } else if (asset.type === 'USDC') {
+          // USDC: 6 decimals, 1:1 USD
+          const seizeWei = seizeUSD >= asset.valueUSD
+            ? asset.balanceWei! // take full balance if covering full value (avoid rounding dust)
+            : BigInt(Math.floor(seizeUSD * 1e6));
+          seizurePlan.push({ ...asset, seizeUSD, seizeWei });
+        } else if (asset.type === 'ETH') {
+          // ETH: 18 decimals
+          const seizeWei = seizeUSD >= asset.valueUSD
+            ? asset.balanceWei!
+            : BigInt(Math.floor(seizeUSD / ethPrice * 1e18));
+          seizurePlan.push({ ...asset, seizeUSD, seizeWei });
+        } else if (asset.type === 'CC' || asset.type === 'CUSDC') {
+          // CC / CUSDC: decimal amount
+          const seizeNum = seizeUSD >= asset.valueUSD
+            ? asset.balanceNum!
+            : seizeUSD / asset.price;
+          seizurePlan.push({ ...asset, seizeUSD, seizeNum });
+        }
+
+        remainingDebt -= seizeUSD;
+      }
+
+      // ── Phase 3: Execute ────────────────────────────────────────────
+      // Track per-escrow records for the LiquidationRecord
+      const escrowRecordMap = new Map<string, LiquidationRecord['escrowLiquidations'][0]>();
+
+      // Helper: bridge EVM USDC to Canton — transfer operator's existing CUSDC to broker
+      const bridgeToCanton = async (bridgeAmountUSD: number) => {
+        if (bridgeAmountUSD <= 0) return;
+        try {
+          // Transfer CUSDC from operator/custodian to broker via custodian withdraw
+          await fetch('/api/custodian/withdraw', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ receiverParty: pos.broker, amount: bridgeAmountUSD }),
+          });
+          cantonSettlement.push({
+            symbol: 'CUSDC', amount: bridgeAmountUSD,
+            valueUSD: bridgeAmountUSD, source: 'bridge',
+          });
+          console.log(`[Liquidation] Bridged ${bridgeAmountUSD} CUSDC to broker on Canton`);
+        } catch (err) {
+          console.warn('[Liquidation] Canton bridge failed:', err);
+        }
+      };
+
+      // EVM seizure destination: operator bridge address (falls back to broker EVM)
+      const evmRecipient = operatorEvmAddr || brokerEvmAddr!.address;
+
+      for (const plan of seizurePlan) {
+        if (plan.type === 'USDC' && plan.seizeWei && plan.seizeWei > BigInt(0)) {
+          const key = `${plan.chainId}-${plan.escrowAddress}`;
+          if (!escrowRecordMap.has(key)) {
+            escrowRecordMap.set(key, {
+              chain: CHAIN_ID_TO_NAME[plan.chainId!] || plan.chain!,
+              custodyAddress: plan.escrowAddress!,
+              ethSeized: '0', ethValueUSD: 0, usdcSeized: '0', txHashes: [],
+            });
+          }
+          const record = escrowRecordMap.get(key)!;
+          record.usdcSeized = (Number(plan.seizeWei) / 1e6).toFixed(2);
+          // Send USDC to operator bridge address (not broker EVM)
+          const callData = encodeLiquidateERC20(plan.usdcTokenAddress!, evmRecipient, plan.seizeWei);
+          try {
+            const txResult = await sdk.sendContractCall(plan.escrowAddress!, callData, plan.chainId!);
+            escrowTxHashes.push(txResult.transactionHash);
+            record.txHashes.push(txResult.transactionHash);
+            console.log(`[Liquidation] USDC seized $${plan.seizeUSD.toFixed(2)} on chain ${plan.chainId}:`, txResult.transactionHash);
+            // Bridge: mint equivalent CUSDC on Canton and transfer to broker
+            await bridgeToCanton(plan.seizeUSD);
+          } catch (err) {
+            console.warn(`[Liquidation] USDC seizure failed on chain ${plan.chainId}:`, err);
+          }
+
+        } else if (plan.type === 'ETH' && plan.seizeWei && plan.seizeWei > BigInt(0)) {
+          const key = `${plan.chainId}-${plan.escrowAddress}`;
+          if (!escrowRecordMap.has(key)) {
+            escrowRecordMap.set(key, {
+              chain: CHAIN_ID_TO_NAME[plan.chainId!] || plan.chain!,
+              custodyAddress: plan.escrowAddress!,
+              ethSeized: '0', ethValueUSD: 0, usdcSeized: '0', txHashes: [],
+            });
+          }
+          const record = escrowRecordMap.get(key)!;
+          record.ethSeized = (Number(plan.seizeWei) / 1e18).toFixed(6);
+          record.ethValueUSD = plan.seizeUSD;
+          // amountOutMin: testnet=0 (low Uniswap liquidity), mainnet=98% of seized USD value in USDC
+          const amountOutMin = getNetworkMode() === 'testnet'
+            ? BigInt(0)
+            : BigInt(Math.round(plan.seizeUSD * 0.98 * 1e6));
+          // Send swapped USDC to operator bridge address (not broker EVM)
+          const callData = encodeLiquidateETH(evmRecipient, plan.seizeWei, amountOutMin);
+          try {
+            const txResult = await sdk.sendContractCall(plan.escrowAddress!, callData, plan.chainId!);
+            escrowTxHashes.push(txResult.transactionHash);
+            record.txHashes.push(txResult.transactionHash);
+            console.log(`[Liquidation] ETH seized $${plan.seizeUSD.toFixed(2)} on chain ${plan.chainId}:`, txResult.transactionHash);
+            // Bridge: mint equivalent CUSDC on Canton and transfer to broker
+            await bridgeToCanton(plan.seizeUSD);
+          } catch (err) {
+            console.warn(`[Liquidation] ETH seizure failed on chain ${plan.chainId}:`, err);
+          }
+
+        } else if (plan.type === 'USDC_CANTON' && plan.seizeNum && plan.seizeNum > 0) {
+          // Canton USDC: withdraw from vault, then transfer USDCHolding to broker
+          const isPartial = plan.seizeNum < plan.balanceNum!;
+          try {
+            const freshVaults = await sdk.cantonQuery({
+              templateId: TEMPLATE_IDS.VAULT,
+              filter: { vaultId: pos.vaultId }
+            });
+            if (freshVaults.length === 0) continue;
+
+            await sdk.cantonExercise({
+              contractId: freshVaults[0].contractId,
+              templateId: TEMPLATE_IDS.VAULT,
+              choice: CHOICES.WITHDRAW_ASSET,
+              argument: { assetId: plan.assetId!, issuer: owner }
+            });
+            console.log(`[Liquidation] Canton USDC withdrawn from vault: ${plan.balanceNum} (seizing ${plan.seizeNum.toFixed(4)})`);
+
+            // Transfer via Canton JSON API (USDCHolding Split+Transfer)
+            try {
+              const withdrawRes = await fetch('/api/custodian/withdraw-usdc', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ receiverParty: pos.broker, amount: plan.seizeNum }),
+              });
+              const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
+              if (!withdrawRes.ok || !withdrawData.success) {
+                console.warn(`[Liquidation] Canton USDC transfer to broker failed:`, withdrawData.error);
+              } else {
+                console.log(`[Liquidation] Canton USDC transferred to broker: ${plan.seizeNum} USDC`);
+              }
+            } catch (err) {
+              console.warn(`[Liquidation] Canton USDC custodian transfer error:`, err);
+            }
+
+            ccSeized.push({
+              symbol: 'USDC',
+              amount: plan.seizeNum,
+              valueUSD: plan.seizeUSD,
+            });
+
+            cantonSettlement.push({
+              symbol: 'USDC',
+              amount: plan.seizeNum,
+              valueUSD: plan.seizeUSD,
+              source: 'direct',
+            });
+
+            // Re-deposit remainder if partial
+            if (isPartial) {
+              const remainder = plan.balanceNum! - plan.seizeNum;
+              const remainderValueUSD = remainder * plan.price;
+              try {
+                const newAssetId = `USDC-liq-remainder-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+                const issuanceResult = await sdk.cantonCreate({
+                  templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+                  payload: {
+                    issuer: owner, recipient: owner,
+                    assetId: newAssetId, assetType: mapAssetTypeToEnum('USDC'),
+                    amount: toDecimal10(remainder),
+                    valueUSD: toDecimal10(remainderValueUSD),
+                  },
+                });
+                const acceptResult = await sdk.cantonExercise({
+                  contractId: issuanceResult.contractId,
+                  templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+                  choice: 'Accept',
+                  argument: {},
+                });
+                const tokenCid = acceptResult.events?.find(
+                  (e: { templateId: string }) => e.templateId.includes('TokenizedAsset')
+                )?.contractId;
+                if (tokenCid) {
+                  const reVaults = await sdk.cantonQuery({
+                    templateId: TEMPLATE_IDS.VAULT,
+                    filter: { vaultId: pos.vaultId },
+                  });
+                  if (reVaults.length > 0) {
+                    await sdk.cantonExercise({
+                      contractId: reVaults[0].contractId,
+                      templateId: TEMPLATE_IDS.VAULT,
+                      choice: CHOICES.DEPOSIT_ASSET,
+                      argument: { assetCid: tokenCid },
+                    });
+                    console.log(`[Liquidation] Canton USDC remainder re-deposited: ${remainder.toFixed(4)}`);
+                  }
+                }
+              } catch (err) {
+                console.warn('[Liquidation] Canton USDC remainder re-deposit failed:', err);
+              }
+            }
+          } catch (err) {
+            console.warn('[Liquidation] Canton USDC seizure failed:', err);
+          }
+
+        } else if ((plan.type === 'CC' || plan.type === 'CUSDC') && plan.seizeNum && plan.seizeNum > 0) {
+          const isPartial = plan.seizeNum < plan.balanceNum!;
+          try {
+            // Re-query vault (WithdrawAsset archives + recreates)
+            const freshVaults = await sdk.cantonQuery({
+              templateId: TEMPLATE_IDS.VAULT,
+              filter: { vaultId: pos.vaultId }
+            });
+            if (freshVaults.length === 0) continue;
+
+            // Withdraw full entry from Daml vault (all-or-nothing per assetId)
+            await sdk.cantonExercise({
+              contractId: freshVaults[0].contractId,
+              templateId: TEMPLATE_IDS.VAULT,
+              choice: CHOICES.WITHDRAW_ASSET,
+              argument: { assetId: plan.assetId!, issuer: owner }
+            });
+            console.log(`[Liquidation] ${plan.type} withdrawn from vault: ${plan.balanceNum} ${plan.type} (seizing ${plan.seizeNum.toFixed(4)})`);
+
+            // Transfer seized portion to broker via custodian
+            try {
+              const withdrawRes = await fetch('/api/custodian/withdraw', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ receiverParty: pos.broker, amount: plan.seizeNum }),
+              });
+              const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
+              if (!withdrawRes.ok || !withdrawData.success) {
+                console.warn(`[Liquidation] ${plan.type} transfer to broker failed:`, withdrawData.error);
+              } else {
+                console.log(`[Liquidation] ${plan.type} transferred to broker: ${plan.seizeNum} ${plan.type}`);
+              }
+            } catch (err) {
+              console.warn(`[Liquidation] ${plan.type} custodian transfer error:`, err);
+            }
+
+            ccSeized.push({
+              symbol: plan.type,
+              amount: plan.seizeNum,
+              valueUSD: plan.seizeUSD,
+            });
+
+            cantonSettlement.push({
+              symbol: plan.type,
+              amount: plan.seizeNum,
+              valueUSD: plan.seizeUSD,
+              source: 'direct',
+            });
+
+            // Re-deposit remainder back into vault if partial seizure
+            if (isPartial) {
+              const remainder = plan.balanceNum! - plan.seizeNum;
+              const remainderValueUSD = remainder * plan.price;
+              try {
+                const newAssetId = `${plan.type}-liq-remainder-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+                const issuanceResult = await sdk.cantonCreate({
+                  templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+                  payload: {
+                    issuer: owner, recipient: owner,
+                    assetId: newAssetId, assetType: mapAssetTypeToEnum(plan.type),
+                    amount: toDecimal10(remainder),
+                    valueUSD: toDecimal10(remainderValueUSD),
+                  },
+                });
+                const acceptResult = await sdk.cantonExercise({
+                  contractId: issuanceResult.contractId,
+                  templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+                  choice: 'Accept',
+                  argument: {},
+                });
+                const tokenCid = acceptResult.events?.find(
+                  (e: { templateId: string }) => e.templateId.includes('TokenizedAsset')
+                )?.contractId;
+                if (tokenCid) {
+                  const reVaults = await sdk.cantonQuery({
+                    templateId: TEMPLATE_IDS.VAULT,
+                    filter: { vaultId: pos.vaultId },
+                  });
+                  if (reVaults.length > 0) {
+                    await sdk.cantonExercise({
+                      contractId: reVaults[0].contractId,
+                      templateId: TEMPLATE_IDS.VAULT,
+                      choice: CHOICES.DEPOSIT_ASSET,
+                      argument: { assetCid: tokenCid },
+                    });
+                    console.log(`[Liquidation] ${plan.type} remainder re-deposited: ${remainder.toFixed(4)} ${plan.type}`);
+                  }
+                }
+              } catch (err) {
+                console.warn(`[Liquidation] ${plan.type} remainder re-deposit failed:`, err);
+              }
+            }
+          } catch (err) {
+            console.warn(`[Liquidation] ${plan.type} seizure failed for ${plan.assetId}:`, err);
+          }
+        }
+      }
+
+      // Collect escrow records for LiquidationRecord
+      for (const record of escrowRecordMap.values()) {
+        escrowLiquidations.push(record);
+      }
+    }
+    const escrowTxHash = escrowTxHashes[0];
+
+    // 10. Store liquidation record
+    liquidationRecords.set(pos.positionId, {
+      positionId: pos.positionId,
+      liquidatedAt,
+      liquidationAmountUSD,
+      pnl,
+      collateralValueAtLiquidation: liveCollateralValue,
+      ltvAtLiquidation: pos.currentLTV,
+      ltvThreshold,
+      escrowLiquidations,
+      ccSeized,
+      cantonSettlement,
+      brokerRecipient,
+      brokerCantonParty,
+    });
+
     // 11. Exercise LiquidatePosition on Canton
+    //     LiquidatePosition has `controller operator` so we must include the
+    //     operator party in actAs even when the broker initiates the call.
+    const operatorParty = await getOperatorParty();
+    const actAsParties = operatorParty ? [operatorParty] : [];
     await sdk.cantonExercise({
       contractId,
       templateId: TEMPLATE_IDS.POSITION,
@@ -2038,8 +3096,9 @@ export const positionAPI = {
       argument: {
         ltvThreshold: toDecimal10(ltvThreshold),
         liquidatedAmount: toDecimal10(liquidationAmountUSD),
-        liquidatedAt: new Date().toISOString(),
+        liquidatedAt,
       },
+      actAs: actAsParties,
     });
 
     // 12. Return result
@@ -2050,6 +3109,10 @@ export const positionAPI = {
         escrowTxHash,
       },
     };
+  },
+
+  getLiquidationRecord: (positionId: string): LiquidationRecord | undefined => {
+    return liquidationRecords.get(positionId);
   },
 };
 

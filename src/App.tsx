@@ -5,7 +5,6 @@ import {
   Dashboard as DashboardIcon,
   AccountBalance,
   VerifiedUser,
-  Warning,
   Settings,
   Description,
   PersonAdd,
@@ -20,10 +19,10 @@ import {
 import { getSDK, type AuthUser, type Asset } from '@stratos-wallet/sdk';
 import { RoleProvider, useRole } from './context/RoleContext';
 import { assetAPI } from './services/api';
+import { setNetworkMode, type NetworkMode } from './services/evmEscrow';
 import Dashboard from './pages/Dashboard';
 import VaultManagement from './pages/VaultManagement';
 import MarginVerification from './pages/MarginVerification';
-import Settlement from './pages/Settlement';
 import Positions from './pages/Positions';
 import FundBrokerLinks from './pages/FundBrokerLinks';
 import BrokerFundLinks from './pages/BrokerFundLinks';
@@ -36,7 +35,6 @@ const allMenuItems = [
   { path: '/brokers', label: 'My Brokers', icon: Handshake, roles: ['fund'] as string[] },
   { path: '/funds', label: 'Client Accounts', icon: People, roles: ['primebroker'] as string[] },
   { path: '/margin', label: 'Margin Verification', icon: VerifiedUser, roles: ['fund', 'primebroker'] as string[] },
-  { path: '/settlement', label: 'Margin Calls', icon: Warning, roles: ['fund', 'primebroker'] as string[] },
 ];
 
 const bottomMenuItems = [
@@ -809,8 +807,6 @@ function AppRoutes({ user, assets }: { user: AuthUser; assets: Asset[] }) {
         {/* Shared pages */}
         <Route path="/positions" element={<Positions user={user} assets={assets} />} />
         <Route path="/margin" element={<MarginVerification user={user} />} />
-        <Route path="/settlement" element={<Settlement user={user} />} />
-
         {/* Admin: role management (operator only) */}
         {isOperator && (
           <Route path="/admin" element={<OperatorSetup user={user} />} />
@@ -887,6 +883,12 @@ function AppContent() {
         setConnected(state.connected);
         setUser(state.user);
 
+        // Detect network mode from wallet SDK (cast through unknown — field added in SDK update)
+        const network = (state as unknown as { network?: NetworkMode }).network;
+        if (network) {
+          setNetworkMode(network);
+        }
+
         if (state.connected) {
           const assetsData = await sdk.getAssets();
           setAssets(assetsData);
@@ -901,6 +903,18 @@ function AppContent() {
 
     init();
 
+    // Listen for network changes from wallet
+    const handleWalletMessage = (event: MessageEvent) => {
+      const msg = event.data;
+      if (msg?.type === 'wallet_event' && msg.event === 'networkChanged') {
+        const net = msg.data as NetworkMode;
+        if (net === 'mainnet' || net === 'testnet') {
+          setNetworkMode(net);
+        }
+      }
+    };
+    window.addEventListener('message', handleWalletMessage);
+
     sdk.on('assetsChanged', setAssets);
     sdk.on('userChanged', (newUser) => {
       setUser(newUser);
@@ -912,36 +926,9 @@ function AppContent() {
       }
     });
 
-    // Poll for user changes — the parent portal may swap users without
-    // sending a userChanged event to the iframe
-    let lastSeenPartyId = '__unset__';
-    const pollUser = setInterval(async () => {
-      try {
-        const state = await sdk.connect();
-        const currentPartyId = state.user?.partyId || state.user?.id || '';
-        if (lastSeenPartyId === '__unset__') {
-          // First poll — just record, don't trigger update
-          lastSeenPartyId = currentPartyId;
-          return;
-        }
-        if (currentPartyId !== lastSeenPartyId) {
-          lastSeenPartyId = currentPartyId;
-          setUser(state.user);
-          setConnected(state.connected);
-          if (state.connected) {
-            sdk.getAssets().then(setAssets).catch(() => {});
-          } else {
-            setAssets([]);
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }, 2000);
-
     return () => {
       sdk.removeAllListeners();
-      clearInterval(pollUser);
+      window.removeEventListener('message', handleWalletMessage);
     };
   }, []);
 

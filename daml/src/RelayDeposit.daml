@@ -1,0 +1,37 @@
+module RelayDeposit where
+
+-- Records a pending relay deposit: user sent funds to the relay contract,
+-- awaiting the operator/custodian worker to forward them to the vault's escrow.
+--
+-- Lifecycle:
+--   1. User deposits ETH to relay  → app creates PendingRelayDeposit
+--   2. Custodian worker reads pending deposits
+--   3. Worker calls relay.forwardETH(escrow, amount) on-chain
+--   4. Worker exercises ConfirmForward → archives this contract
+
+template PendingRelayDeposit
+  with
+    owner : Party
+    operator : Party
+    vaultId : Text
+    escrowAddress : Text      -- target escrow contract on EVM
+    relayAddress : Text       -- relay contract that holds the funds
+    chainId : Int             -- EVM chain ID
+    amount : Decimal          -- amount in native units (ETH)
+    depositTxHash : Text      -- user's deposit tx hash for audit
+    symbol : Text
+  where
+    signatory owner
+    observer operator
+
+    -- Operator confirms the forward was executed on-chain
+    choice ConfirmForward : ()
+      with
+        forwardTxHash : Text
+      controller operator
+      do return ()
+
+    -- Owner can cancel (reclaim from relay directly)
+    choice CancelDeposit : ()
+      controller owner
+      do return ()

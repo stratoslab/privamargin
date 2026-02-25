@@ -1,0 +1,16 @@
+name = "privamargin-escrow-deployer"
+account_id = "325f8b322c30ee0f5460cfdaef82ecf5"
+main = "deployer-worker.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# RPC endpoints for each chain (public RPCs, replace with private for production)
+RPC_SEPOLIA = "https://ethereum-sepolia-rpc.publicnode.com"
+RPC_BASE_SEPOLIA = "https://base-sepolia-rpc.publicnode.com"
+RPC_ETHEREUM = "https://ethereum-rpc.publicnode.com"
+RPC_BASE = "https://base-rpc.publicnode.com"
+
+# Secrets (set via `wrangler secret put`):
+# - DEPLOYER_PRIVATE_KEY  — hex-encoded private key for the dedicated deployer EOA
+# - API_SECRET            — shared secret for authenticating requests from privamargin

@@ -1,108 +1,772 @@
 # PrivaMargin
 
-Privacy-preserving collateral management on Canton + EVM.
+Privacy-preserving prime brokerage margin management on Canton Network.
 
-## Overview
+PrivaMargin enables hedge funds to prove margin sufficiency to prime brokers using zero-knowledge proofs — brokers verify collateral adequacy without seeing individual asset values. Collateral lives in self-custodied EVM escrow contracts and Canton-native vaults, with proportional liquidation that seizes only what's owed.
 
-PrivaMargin enables funds to pledge collateral against trading positions with prime brokers, using Canton/Daml for auditable business logic and EVM smart contracts for on-chain custody. Margin verification, position management, and liquidation are coordinated across both ledger layers.
+## Table of Contents
 
-## Architecture
+- [Architecture Overview](#architecture-overview)
+- [Role Hierarchy](#role-hierarchy)
+- [Daml Smart Contracts](#daml-smart-contracts)
+- [EVM Contracts](#evm-contracts)
+- [Zero-Knowledge Proof System](#zero-knowledge-proof-system)
+- [Collateral Vaults](#collateral-vaults)
+- [Position Lifecycle](#position-lifecycle)
+- [Liquidation Workflow](#liquidation-workflow)
+- [Broker-Fund Relationships](#broker-fund-relationships)
+- [Margin Verification](#margin-verification)
+- [API Layer](#api-layer)
+- [Cloudflare Pages Functions](#cloudflare-pages-functions)
+- [Frontend Pages](#frontend-pages)
+- [Chain Support](#chain-support)
+- [Build & Deploy](#build--deploy)
 
-| Layer | Technology | Purpose |
-|-------|-----------|---------|
-| Business Logic | Canton / Daml | Vaults, positions, roles, margin calls, broker-fund links |
-| On-chain Custody | Solidity (VaultEscrow) | Per-vault escrow holding ETH/ERC20 on EVM chains |
-| Privacy Pool | Solidity (DepositRelay) | Shared deposit pool that breaks depositor-escrow traceability |
-| Wallet / Signing | Stratos SDK | Key management, EVM transactions, Canton contract operations |
-| Frontend | React + MUI | Operator, broker, and fund dashboards |
-| API / Config | Cloudflare Pages Functions + KV | Config persistence (operator party, relay addresses, platform assets) |
+---
 
-## Roles
+## Architecture Overview
 
-- **Operator** — Platform administrator. Creates role assignments, deploys escrow/relay contracts, configures platform assets.
-- **PrimeBroker** — Issues invitations to funds, sets LTV thresholds, manages positions, triggers margin calls and liquidations.
-- **Fund** — Creates vaults, deposits collateral, accepts broker invitations, opens positions.
-
-## Lifecycle
-
-1. **Setup** — Operator creates `OperatorRole` contract on Canton.
-2. **Role Assignment** — Operator assigns PrimeBroker and Fund roles via `AssignPrimeBroker` / `AssignFund`.
-3. **Invitations** — Broker sends `BrokerFundInvitation` to fund; fund accepts to create `BrokerFundLink`.
-4. **Vault Creation** — Fund creates a `CollateralVault` on Canton.
-5. **Escrow Deployment** — Fund deploys a `VaultEscrow` contract on an EVM chain, registered on the vault.
-6. **Deposits** — Fund deposits ETH/ERC20 into the escrow (or via DepositRelay for privacy). Deposit recorded on Canton with tx hash.
-7. **Positions** — Fund opens positions referencing a vault. LTV is calculated from live collateral value vs notional.
-8. **Margin Verification** — Broker monitors LTV against threshold. If breached, a `WorkflowMarginCall` is created.
-9. **Liquidation** — If LTV exceeds threshold, broker liquidates: escrow wraps ETH to WETH, swaps to USDC via Uniswap V3, sends to broker. Canton position updated to `Liquidated`.
-
-## EVM Escrow System
-
-### VaultEscrow (per-vault custody)
-
-Each vault gets its own `VaultEscrow` contract on an EVM chain. The deployer is the immutable owner; a separate liquidator address is set at deployment.
-
-- **Deposits**: Native ETH via `receive()`, ERC20 via direct transfer
-- **Withdrawals**: Owner calls `withdrawETH` / `withdrawERC20`
-- **Liquidation**: Liquidator calls `liquidate` — wraps ETH to WETH, swaps to USDC via Uniswap V3 `exactInputSingle`, sends USDC to broker
-
-### DepositRelay (privacy pool)
-
-One `DepositRelay` per chain. Funds deposit into the shared pool; the operator forwards batched amounts to individual escrows. Events intentionally omit `msg.sender` to break on-chain traceability.
-
-- `depositERC20(token, amount)` — Fund deposits ERC20
-- `receive()` — Fund deposits ETH
-- `forwardETH(to, amount)` — Operator forwards to escrow
-- `forwardERC20(token, to, amount)` — Operator forwards ERC20 to escrow
-
-Deposit routing: if a relay is deployed for the target chain, deposits go to the relay; otherwise they fall back to direct escrow transfer.
-
-## Network Configuration
-
-Set `VITE_NETWORK_MODE` to switch between testnet and mainnet:
-
-| Mode | Default Chain | Available Chains |
-|------|--------------|------------------|
-| `testnet` (default) | Sepolia (11155111) | Sepolia |
-| `mainnet` | Ethereum (1) | Ethereum, Base |
-
-```bash
-# .env
-VITE_NETWORK_MODE=testnet   # or mainnet
+```
+┌─────────────────────────────────────────────────────────┐
+│                    React Frontend                        │
+│  Dashboard · Vaults · Positions · Brokers · Admin        │
+├──────────────┬──────────────────────┬───────────────────┤
+│  api.ts      │  evmEscrow.ts        │  zkProof.ts       │
+│  (Canton SDK │  (ABI encoding,      │  (Groth16 proof   │
+│   + service  │   chain config,      │   generation &    │
+│   layer)     │   contract deploy)   │   verification)   │
+├──────────────┴──────────────────────┴───────────────────┤
+│              Cloudflare Pages Functions                   │
+│  /api/config · /api/prices · /api/escrow/deploy          │
+│  /api/escrow/balances · /api/custodian/*  · /api/roles   │
+├─────────────────────────┬───────────────────────────────┤
+│     Canton Network      │        EVM Chains              │
+│  (Daml ledger)          │  (Ethereum, Base)              │
+│                         │                                │
+│  Vaults · Positions     │  VaultEscrow.sol               │
+│  Roles · Links          │  (per-vault, self-custodied)   │
+│  Assets · Locks         │                                │
+│  Margin Verification    │  Uniswap V3 (ETH→USDC swap)   │
+└─────────────────────────┴───────────────────────────────┘
 ```
 
-## Supported Chains
+**Dual ledger model**: Canton (Daml) is the source of truth for contract state — vaults, positions, roles, and broker-fund links. EVM chains hold actual crypto collateral in per-vault escrow contracts. The two are synchronized via the API layer.
 
-| Chain | ID | SwapRouter | WETH | USDC |
-|-------|-----|-----------|------|------|
-| Ethereum | 1 | `0xE592427A0AEce92De3Edee1F18E0157C05861564` | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` |
-| Sepolia | 11155111 | `0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E` | `0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14` | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
-| Base | 8453 | `0x2626664c2603336E57B271c5C0b26F421741e481` | `0x4200000000000000000000000000000000000006` | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
+**Privacy model**: Funds' actual collateral values are hidden from brokers. Brokers only see ZK-verified sufficiency status ("Sufficient" or "Insufficient"). The ZK circuit proves LTV correctness without revealing individual asset values.
 
-Relay addresses are stored in Cloudflare KV at runtime (key: `relay_<chainId>`).
+---
 
-## Development
+## Role Hierarchy
+
+Three roles form a hierarchy managed on the Canton ledger:
+
+| Role | Description | Assigned By |
+|------|-------------|-------------|
+| **Operator** | System administrator. Manages platform configuration, provisions custodian, assigns roles. | Self (first user claims) |
+| **Prime Broker** | Manages fund relationships, monitors margin, triggers liquidations. | Operator |
+| **Fund** | Manages collateral vaults, opens/closes positions, responds to margin calls. | Operator or Prime Broker |
+
+Roles are recorded as `RoleAssignment` contracts on Canton. The operator creates an `OperatorRole` contract at system initialization, then uses `AssignPrimeBroker` and `AssignFund` choices to grant roles. Brokers can also assign fund roles via `BrokerRole.BrokerAssignFund`.
+
+---
+
+## Daml Smart Contracts
+
+All contracts are defined in `daml/src/` and compiled to a DAR package (`daml/.daml/dist/privamargin3-0.6.0.dar`). SDK version: 3.4.9, target: Canton 2.1.
+
+### `Roles.daml` — Role Management
+
+```
+OperatorRole (signatory: operator)
+  ├── AssignPrimeBroker(broker) → RoleAssignment
+  └── AssignFund(fund)          → RoleAssignment
+
+BrokerRole (signatory: operator, broker)
+  └── BrokerAssignFund(fund)    → RoleAssignment
+
+RoleAssignment (signatory: operator; observer: party)
+  └── RevokeRole()
+```
+
+### `BrokerFundLink.daml` — Broker-Fund Relationships
+
+```
+BrokerFundInvitation (signatory: broker, operator; observer: fund)
+  ├── AcceptInvitation() → BrokerFundLink
+  └── RejectInvitation()
+
+BrokerFundLink (signatory: broker, fund, operator)
+  ├── SetLTVThreshold(newThreshold)
+  ├── DeactivateLink()
+  ├── UpdateAllowedAssets(newAllowedAssets)
+  ├── UpdateAllowedCollaterals(newAllowedCollaterals)
+  ├── GetLTVThreshold() → Decimal           [nonconsuming]
+  └── ProposeLTVChange(...) → LTVChangeProposal  [nonconsuming]
+
+LTVChangeProposal (signatory: broker, operator; observer: fund)
+  ├── AcceptProposal() → BrokerFundLink (with new threshold)
+  └── RejectProposal() (deactivates link)
+```
+
+Each link stores configurable `ltvThreshold` (default 0.8 = 80%), `allowedAssets` (tradeable symbols), and `allowedCollaterals` (depositable symbols). Default allowed symbols: BTC, ETH, SOL, CC, USDC, USDT, TRX, TON, CUSD.
+
+### `CollateralVault.daml` — Vault Management
+
+```
+CollateralVault (signatory: owner; observer: operator)
+  Fields:
+    vaultId, owner, operator, collateralAssets: [AssetPosition],
+    totalValue, linkedPositions, chainVaults: [{chain, custodyAddress}],
+    depositRecords: [{txId, chain, symbol, amount}], createdAt
+
+  Choices:
+    ├── DepositAsset(assetCid)          — adds TokenizedAsset to vault
+    ├── DepositAssetWithTx(assetCid, txId, chain, symbol, amount)
+    ├── WithdrawAsset(assetId)          — removes asset by ID (all-or-nothing)
+    ├── RegisterChainVault(chain, addr) — links an EVM escrow address
+    ├── RecordDeposit(txId, chain, symbol, amount)
+    ├── GetVaultInfo()                  — returns (totalValue, assetCount) [nonconsuming]
+    └── CloseVault()                    — archives the contract
+
+AssetPosition = { assetId, assetType, amount, valueUSD }
+```
+
+**Key constraint**: `WithdrawAsset` removes an entire `AssetPosition` by `assetId` — there is no partial withdrawal parameter. This is handled during liquidation by withdrawing the full entry, transferring the needed portion, and re-depositing the remainder.
+
+### `Assets.daml` — Tokenized Assets
+
+```
+AssetIssuance (signatory: issuer; observer: recipient)
+  └── Accept() → TokenizedAsset
+
+TokenizedAsset (signatory: issuer, owner)
+  ├── Transfer(newOwner) → TokenizedAsset
+  └── UpdateValue(newValueUSD) → TokenizedAsset
+```
+
+Asset types: `CantonCoin | Stablecoin | Cryptocurrency | RWA | Bond | Equity`
+
+The `AssetIssuance → Accept` pattern is used throughout for minting: the issuer creates an issuance, the recipient accepts it, producing a `TokenizedAsset` that can be deposited into a vault.
+
+### `Position.daml` — Trading Positions
+
+```
+Position (signatory: fund; observer: broker, operator)
+  Fields:
+    positionId, vaultId, fund, broker, operator, description,
+    notionalValue, collateralValue, currentLTV,
+    status: Open | MarginCalled | Liquidated | Closed,
+    direction: Optional (Long | Short),
+    entryPrice, units, unrealizedPnL, createdAt, lastChecked
+
+  Choices:
+    ├── UpdateLTV(newCollateralValue, newLTV, checkedAt, newPnL)  [controller: operator]
+    ├── MarkMarginCalled()                                        [controller: operator]
+    ├── ClosePosition()                                           [controller: fund]
+    └── LiquidatePosition(ltvThreshold, liquidatedAmount, liquidatedAt)  [controller: operator]
+```
+
+`LiquidatePosition` enforces two assertions:
+1. `currentLTV >= ltvThreshold` — position must actually be underwater
+2. `status == Open || status == MarginCalled` — can't liquidate already closed/liquidated positions
+
+### `CollateralLock.daml` — Self-Custody Pledges
+
+```
+CollateralLock (signatory: owner; observer: operator)
+  Fields: owner, operator, vaultId, assetType, symbol, amount, valueUSD, lockId
+
+  Choices:
+    ├── Unlock()                          [controller: owner]
+    ├── ForceLiquidate(reason)            [controller: operator]
+    └── UpdateLockValue(newValueUSD)      [controller: operator]
+```
+
+Represents an encumbrance — the owner pledges Canton Coin (CC) as collateral without physically transferring it. The lock records the commitment; actual transfer only happens during liquidation.
+
+### `MarginVerification.daml` — Margin Calls & Settlement
+
+```
+MarginRequirement (signatory: provider, counterparty, operator)
+  ├── VerifyMargin(vaultCid, currentTime) → updated status (Sufficient/Insufficient)
+  └── TriggerMarginCall()                 → MarginCall
+
+MarginCall (signatory: provider, counterparty, operator)
+  ├── SettleMarginCall(vaultCid, settledAssets, settlementTime) → Settlement
+  └── CancelMarginCall()
+
+WorkflowMarginCall (signatory: operator; observer: fund, broker)
+  ├── AcknowledgeMarginCall()  [controller: fund]
+  ├── ResolveMarginCall()      [controller: operator]
+  └── CancelWorkflowMarginCall()
+
+Status flow: WMCActive → WMCAcknowledged → WMCResolved
+```
+
+`WorkflowMarginCall` is the practical margin call template used in the application — it tracks the fund acknowledgement workflow.
+
+---
+
+## EVM Contracts
+
+### `VaultEscrow.sol`
+
+Per-vault self-custody escrow contract deployed on EVM chains. Each vault gets its own escrow per chain.
+
+```solidity
+constructor(address _owner, address _liquidator,
+            address _swapRouter, address _weth, address _stablecoin)
+```
+
+| Function | Access | Description |
+|----------|--------|-------------|
+| `withdrawETH(to, amount)` | `onlyOwner` | Withdraw native ETH to specified address |
+| `withdrawERC20(token, to, amount)` | `onlyOwner` | Withdraw ERC20 tokens to specified address |
+| `liquidate(to, amount, amountOutMinimum)` | `onlyLiquidator` | Wrap ETH→WETH, swap via Uniswap V3 (0.3% pool fee) to USDC, send to broker |
+| `liquidateERC20(token, to, amount)` | `onlyLiquidator` | Direct ERC20 transfer to broker |
+| `getBalance()` | `view` | Returns contract's ETH balance |
+| `receive()` | external | Accepts native ETH deposits |
+
+**Key design**: The fund is the `owner` (can withdraw anytime), the operator/platform is the `liquidator` (can only liquidate, not withdraw). This preserves self-custody while enabling automated liquidation.
+
+**ETH liquidation path**:
+1. Wraps the specified ETH amount to WETH via `deposit()`
+2. Approves Uniswap V3 SwapRouter for the WETH amount
+3. Calls `exactInputSingle` on Uniswap V3 (WETH→USDC, 0.3% pool fee, 0 sqrtPriceLimitX96)
+4. Sends resulting USDC to the broker's address
+5. Remaining ETH stays in escrow untouched
+
+**USDC liquidation path**:
+1. Direct `transfer()` of the specified amount to the broker
+2. No swap needed — USDC is already the settlement currency
+
+All liquidation functions accept partial amounts — this is what enables proportional seizure.
+
+---
+
+## Zero-Knowledge Proof System
+
+PrivaMargin uses Groth16 ZK-SNARKs to prove LTV ratio correctness without revealing individual asset values. The fund generates proofs in-browser; the broker verifies them without seeing the underlying data.
+
+### Circuit: `circuits/ltv_verifier.circom`
+
+```
+Template: LTVVerifier(N=10)
+
+Private inputs (fund's secret):
+  assetValues[10]        — each asset's USD value in cents
+
+Public inputs (known to both parties):
+  notionalValueCents     — position notional in USD cents
+  ltvThresholdBps        — liquidation threshold in basis points (e.g., 8000 = 80%)
+
+Public outputs:
+  computedLTVBps         — LTV ratio in basis points
+  isLiquidatable         — 1 if LTV >= threshold, 0 otherwise
+```
+
+**How it works**:
+1. Sums all 10 asset values → `totalCollateral`
+2. Prover computes `LTV = floor(notionalValueCents × 10000 / totalCollateral)` off-circuit
+3. Circuit verifies via cross-multiplication constraints (avoids division in the circuit):
+   - `computedLTVBps × totalCollateral ≤ notionalValueCents × 10000` (lower bound)
+   - `(computedLTVBps + 1) × totalCollateral > notionalValueCents × 10000` (upper bound)
+4. Compares LTV against threshold using a `GreaterEqThan(16)` comparator
+5. Zero collateral edge case: outputs `99999` (convention for max LTV)
+
+Unused asset slots are padded with zeros. 64-bit comparison supports values up to ~$184 trillion in cents.
+
+### Build Pipeline: `circuits/build.sh`
+
+```bash
+npm run build:zk
+```
+
+Five-step trusted setup process:
+1. **Compile** — circom2 compiles the circuit → R1CS + WASM witness generator
+2. **Powers of Tau** — Phase 1 ceremony (bn128 curve, 2^14 constraints) with random entropy
+3. **Groth16 Setup** — Phase 2 circuit-specific setup with random entropy contribution
+4. **Export** — Verification key exported as JSON
+5. **Deploy** — Copies WASM, zkey, and verification key to `public/zk/`
+
+### Runtime: `src/services/zkProof.ts`
+
+| Function | Caller | Description |
+|----------|--------|-------------|
+| `generateLTVProof(input)` | Fund | Generates Groth16 proof in-browser using snarkjs WASM. Returns proof, public signals, computed LTV, liquidatability flag, and timing. |
+| `verifyLTVProof(proof, publicSignals)` | Broker | Verifies a proof against the verification key. Returns boolean. |
+| `proofHash(proof)` | Display | SHA-256 hex hash of proof for UI display. |
+| `isZKAvailable()` | Startup | Checks if ZK artifacts are accessible (HEAD requests to `/zk/` files). |
+
+Helper conversions:
+- `usdToCents(usd)` — Converts dollar amount to integer cents
+- `ltvToBps(decimal)` — Converts decimal LTV (e.g., 0.8) to basis points (8000)
+
+Artifacts are served as static files from `public/zk/`:
+- `ltv_verifier.wasm` — WASM witness generator
+- `ltv_verifier_final.zkey` — Groth16 proving key
+- `verification_key.json` — Groth16 verification key
+
+---
+
+## Collateral Vaults
+
+A vault is a logical container for a fund's collateral, spanning multiple asset types and chains.
+
+### Vault Structure
+
+```
+CollateralVault (Canton/Daml)
+  │
+  ├── Canton-native assets (CC)
+  │   ├── TokenizedAsset contracts on Daml
+  │   └── CollateralLock (encumbrance record)
+  │
+  ├── EVM Escrow: Sepolia (VaultEscrow.sol)
+  │   ├── Native ETH
+  │   └── USDC (ERC20)
+  │
+  └── EVM Escrow: Base Sepolia (VaultEscrow.sol)
+      ├── Native ETH
+      └── USDC (ERC20)
+```
+
+A single vault can have escrows on multiple EVM chains simultaneously, plus Canton-native CC holdings. Each escrow is a separate `VaultEscrow.sol` deployment.
+
+### Deposit Flow
+
+**EVM assets (ETH, USDC)**:
+1. Fund selects chain and asset from wallet
+2. If no escrow exists for that chain → deploys `VaultEscrow` via `/api/escrow/deploy` (platform deployer pays gas)
+3. Registers escrow address on Daml vault via `RegisterChainVault` choice
+4. Transfers ETH/USDC from wallet to escrow contract address via SDK
+5. Mints a corresponding `TokenizedAsset` on Daml and deposits into vault via `DepositAssetWithTx`
+6. Records deposit transaction details (txId, chain, symbol, amount)
+
+**Canton Coin (CC)**:
+1. Fund initiates CC transfer to the vault custodian party via Splice wallet API
+2. Custodian accepts the transfer offer (`/api/custodian/accept-deposit`)
+3. Creates a `CollateralLock` on Daml (self-custody encumbrance — no physical transfer out of fund's control)
+4. Mints `TokenizedAsset` and deposits into vault
+
+### Withdrawal Flow
+
+**EVM assets**: Fund calls `withdrawETH` or `withdrawERC20` on the VaultEscrow contract (owner-only). Also exercises `WithdrawAsset` on Daml to remove the asset entry.
+
+**CC**: Custodian transfers CC back to the fund via `/api/custodian/withdraw`, then `WithdrawAsset` removes it from the Daml vault.
+
+### Escrow Sync
+
+`syncEscrowDeposits` detects external on-chain deposits (e.g., direct transfers to escrow address that bypassed the UI) by reading on-chain balances via `/api/escrow/balances` and comparing against tracked Daml assets. Untracked balances are minted as new `TokenizedAsset` entries and deposited into the vault.
+
+### Live Price Revaluation
+
+Every time a vault is queried, all asset values are recalculated using live prices from CoinGecko (60-second cache). This ensures LTV ratios reflect current market conditions. Fallback to hardcoded prices if CoinGecko is unavailable.
+
+---
+
+## Position Lifecycle
+
+```
+                    ┌──────────────────┐
+                    │    Fund opens    │
+                    │    position      │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+             ┌──── │      Open        │ ◄────┐
+             │     └────────┬─────────┘      │
+             │              │                 │
+             │    LTV >= threshold            │  LTV recovers
+             │              │                 │
+             │              ▼                 │
+             │     ┌──────────────────┐       │
+             │     │  MarginCalled    │ ──────┘
+             │     └────────┬─────────┘
+             │              │
+             │    Broker liquidates
+             │              │
+             │              ▼
+             │     ┌──────────────────┐
+             │     │   Liquidated     │
+             │     └──────────────────┘
+             │
+             │  Fund closes
+             │
+             ▼
+    ┌──────────────────┐
+    │     Closed       │
+    └──────────────────┘
+```
+
+### Opening a Position
+
+1. Fund selects a linked broker from active `BrokerFundLink` contracts
+2. Selects an asset from the link's `allowedAssets` list
+3. Chooses direction (Long or Short) and number of units
+4. Entry price is fetched live from CoinGecko
+5. Notional value = units × entry price
+6. Fund selects a vault — UI shows projected aggregate LTV after adding this position
+7. Initial LTV is calculated from the vault's live collateral value
+8. `Position` contract is created on Canton with status `Open`
+
+### PnL Calculation (live, recalculated on every query)
+
+```
+For Long positions:
+  unrealizedPnL = (currentPrice - entryPrice) × units
+
+For Short positions:
+  unrealizedPnL = (entryPrice - currentPrice) × units
+
+Effective notional = notionalValue + unrealizedPnL
+LTV = effectiveNotional / collateralValue
+```
+
+When PnL is negative (position is losing money), effective notional increases, pushing LTV higher toward the liquidation threshold.
+
+### Closing a Position
+
+Fund exercises `ClosePosition` choice. Status changes to `Closed`. No collateral movement — the fund retains everything in the vault.
+
+---
+
+## Liquidation Workflow
+
+When a position's LTV exceeds the broker-fund link's threshold, the broker can trigger liquidation. The system seizes only enough collateral to cover the loss — **proportional seizure**, not full vault drain.
+
+### Trigger Conditions
+
+- `currentLTV >= ltvThreshold` (enforced by Daml `LiquidatePosition` assertion)
+- Position status must be `Open` or `MarginCalled`
+- Initiated by the broker (exercised via operator controller on Canton)
+
+### Liquidation Amount
+
+```
+liquidationAmountUSD = |unrealizedPnL|, capped at vault's total collateral value
+```
+
+If PnL is zero or positive (fund is winning), no assets are seized — the position is simply marked `Liquidated` on Daml.
+
+### Proportional Seizure Algorithm
+
+**Phase 1 — Inventory** (read-only, no side effects):
+```
+For each EVM escrow chain linked to the vault:
+  Read ETH balance via /api/escrow/balances
+  Read USDC balance via /api/escrow/balances
+  Fetch ETH live price from CoinGecko
+
+Collect CC assets from vault's collateralAssets on Daml
+
+Build sorted asset list:
+  [{type, chain, balance, valueUSD, price, ...}]
+  Sorted by seizure priority (USDC first, CC second, ETH last)
+```
+
+**Phase 2 — Plan** (pure computation, no side effects):
+```
+remainingDebt = liquidationAmountUSD
+
+For each asset in priority order:
+  seizeUSD  = min(asset.valueUSD, remainingDebt)
+  seizeNative = convert seizeUSD to native units
+  Record { asset, seizeNative, seizeUSD } in seizure plan
+  remainingDebt -= seizeUSD
+  if remainingDebt <= 0: stop
+```
+
+**Phase 3 — Execute** (only planned amounts are touched):
+```
+For each planned seizure with seizeNative > 0:
+  USDC → encodeLiquidateERC20(usdcAddr, brokerAddr, partialAmount)
+  ETH  → encodeLiquidateETH(brokerAddr, partialWei, recalculatedAmountOutMin)
+  CC   → withdraw full entry from Daml vault
+         transfer partial amount to broker via custodian
+         re-deposit remainder back into vault (if any)
+```
+
+### Seizure Priority Order
+
+| Priority | Asset | Rationale |
+|----------|-------|-----------|
+| 1 | **USDC** (all chains) | 1:1 USD value, no swap slippage |
+| 2 | **CC** (Canton Coin) | Stable pricing via `getLivePrice('CC')` |
+| 3 | **ETH** (all chains) | Volatile, incurs Uniswap V3 swap slippage |
+
+### Per-Asset Seizure Details
+
+**USDC**: `seizeWei = min(usdcBalance, BigInt(Math.floor(seizeUSD * 1e6)))` — USDC uses 6 decimals. Calls `liquidateERC20()` on the escrow contract. Remainder stays in escrow.
+
+**ETH**: `seizeWei = min(ethBalance, BigInt(Math.floor(seizeUSD / ethPrice * 1e18)))` — Calls `liquidate()` on the escrow contract. `amountOutMin` is recalculated based on the partial USD value (not the full balance). The escrow wraps partial ETH to WETH, swaps via Uniswap V3, and sends USDC to broker. Remaining ETH stays in escrow.
+
+**CC (partial — only for the last CC entry if needed)**:
+1. `WithdrawAsset` removes the full CC entry from Daml vault (all-or-nothing constraint)
+2. Transfer `seizeAmount` to broker via `/api/custodian/withdraw`
+3. If `remainder > 0`: re-deposit via `AssetIssuance → Accept → DepositAsset` pattern (same mint flow used by all deposits)
+
+**CC (whole entry)**: Same as above but `seizeAmount == entry.amount`, so no re-deposit needed.
+
+### What Arrives at the Broker
+
+| Asset Seized | Broker Receives | Mechanism |
+|-------------|----------------|-----------|
+| USDC | USDC (same amount) | Direct ERC20 transfer to broker's EVM address |
+| ETH | USDC (swap output) | Uniswap V3 WETH→USDC swap, USDC sent to broker's EVM address |
+| CC | CC (Canton Coin) | Splice custodian transfer to broker's Canton party |
+
+### Liquidation Record
+
+Every liquidation stores a `LiquidationRecord` with full audit trail:
+
+```typescript
+{
+  positionId: string;
+  liquidatedAt: string;
+  liquidationAmountUSD: number;        // |PnL| = debt owed
+  pnl: number;                         // unrealized PnL at liquidation
+  collateralValueAtLiquidation: number; // vault value at time of liquidation
+  ltvAtLiquidation: number;            // LTV when liquidation was triggered
+  ltvThreshold: number;                // broker-fund link threshold
+
+  escrowLiquidations: [{               // per-chain EVM seizures
+    chain, custodyAddress,
+    ethSeized, ethValueUSD,
+    usdcSeized, txHashes[]
+  }];
+
+  ccSeized: [{                          // Canton Coin seizures
+    symbol, amount, valueUSD
+  }];
+
+  brokerRecipient: string;             // broker's EVM address
+}
+```
+
+Records are accessible via `positionAPI.getLiquidationRecord(positionId)` and displayed in the Position Detail Dialog.
+
+---
+
+## Broker-Fund Relationships
+
+### Link Lifecycle
+
+```
+Broker sends invitation
+        │
+        ▼
+BrokerFundInvitation  ──► Fund accepts ──► BrokerFundLink (active)
+        │                                        │
+        ▼                                        ├── SetLTVThreshold
+        Fund rejects                             ├── UpdateAllowedAssets
+        (archived)                               ├── UpdateAllowedCollaterals
+                                                 ├── ProposeLTVChange → LTVChangeProposal
+                                                 │       ├── Fund accepts → updated threshold
+                                                 │       └── Fund rejects → link deactivated
+                                                 └── DeactivateLink
+```
+
+### Link Configuration
+
+Each `BrokerFundLink` defines:
+- **LTV Threshold** (default 0.8 = 80%) — positions exceeding this are eligible for liquidation
+- **Allowed Assets** — symbols the fund can trade (e.g., BTC, ETH, SOL, CC, USDC)
+- **Allowed Collaterals** — symbols the fund can deposit as collateral
+
+### LTV Threshold Changes
+
+Brokers can propose threshold changes via `ProposeLTVChange`. This creates an `LTVChangeProposal` that the fund must accept or reject:
+- **Accept**: Threshold is updated on the link. Existing positions continue with new threshold.
+- **Reject**: The entire link is deactivated and all open positions between the pair are closed.
+
+---
+
+## Margin Verification
+
+### LTV Calculation
+
+```
+LTV = Effective Notional Value / Total Collateral Value
+
+Where:
+  Effective Notional = Base Notional + Unrealized PnL
+  Total Collateral   = Sum of all vault assets at live prices
+```
+
+LTV is recalculated on every query using live prices from CoinGecko (60-second cache, fallback to hardcoded prices).
+
+**UI color coding**:
+- **Green** (< 60%): Healthy
+- **Amber** (60%–80%): Warning
+- **Red** (≥ threshold): Critical / Liquidatable
+
+### ZK-Verified Margin
+
+When ZK artifacts are available, margin verification generates a real Groth16 proof:
+
+1. Fund's asset values (private inputs) are converted to cents and padded to 10 slots
+2. Proof is generated in-browser via snarkjs WASM (typically completes in seconds)
+3. Public signals reveal only: computed LTV (basis points), liquidatability flag, notional value, threshold
+4. Broker verifies the proof using only the verification key — **never sees individual asset values**
+5. Proof hash (SHA-256) is displayed in the dashboard for auditability
+
+### What Each Party Sees
+
+| Data Point | Fund | Broker |
+|-----------|------|--------|
+| Individual asset values | Yes | **No** (private ZK input) |
+| Total collateral value | Yes | **No** |
+| LTV ratio | Yes | Yes (ZK output) |
+| Margin sufficiency | Yes | Yes ("Sufficient" / "Insufficient") |
+| Position notional | Yes | Yes (public ZK input) |
+| LTV threshold | Yes | Yes (public ZK input) |
+
+---
+
+## API Layer
+
+### `src/services/api.ts` (~2800 lines)
+
+The central service layer. Communicates with Canton via `@stratos-wallet/sdk` and with EVM chains via Cloudflare Pages Functions.
+
+| API Object | Description |
+|------------|-------------|
+| `roleAPI` | Role management — create operator, assign broker/fund, revoke, query assignments |
+| `vaultAPI` | Vault lifecycle — create, deposit (EVM + CC), withdraw, deploy escrow, sync, close |
+| `positionAPI` | Position lifecycle — create, list with live PnL, close, liquidate, get liquidation record |
+| `marginAPI` | Margin verification with optional ZK proofs, margin call management |
+| `linkAPI` | Broker-fund link queries, threshold/allowed-assets configuration |
+| `invitationAPI` | Invitation send/accept/reject workflow |
+| `proposalAPI` | LTV change proposal workflow (propose, accept, reject) |
+| `assetAPI` | Platform asset types configuration, live price fetching via CoinGecko |
+| `workflowMarginCallAPI` | Margin call lifecycle — list, acknowledge, resolve, cancel |
+
+Key utility exports:
+- `getLivePrice(symbol)` — Live price with CoinGecko + 60s cache, fallback to hardcoded
+- `getOperatorParty()` / `getCustodianParty()` — Platform party lookups from `/api/config`
+
+### `src/services/evmEscrow.ts`
+
+EVM contract interaction utilities. Hand-rolled ABI encoding (no ethers.js dependency). Uses `viem` for contract deployment.
+
+Key exports:
+- `CHAIN_CONFIG` — Per-chain Uniswap V3 SwapRouter, WETH, USDC addresses
+- `VAULT_ESCROW_BYTECODE` — Pre-compiled VaultEscrow bytecode (solc 0.8.34, optimized)
+- `encode*` functions — ABI encoding for all escrow contract calls
+- `deployEscrowContract()` — Client-side contract deployment via SDK
+- `pollForContractAddress()` — Polls tx receipt until deployed address appears
+- Network mode support (`testnet` / `mainnet` via `VITE_NETWORK_MODE` env var)
+
+### `src/services/zkProof.ts`
+
+ZK proof generation and verification. Loads circuit artifacts from `/zk/` static assets. See [Zero-Knowledge Proof System](#zero-knowledge-proof-system).
+
+---
+
+## Cloudflare Pages Functions
+
+Serverless API endpoints deployed alongside the frontend. Use Cloudflare KV (`PRIVAMARGIN_CONFIG` namespace) for configuration persistence.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/config` | GET/POST | Platform configuration — operator party, custodian party, platform assets |
+| `/api/roles` | GET/POST/DELETE | Role assignment with permission checks (operator→broker/fund, broker→fund) |
+| `/api/prices` | GET | Live asset prices via CoinMarketCap API, fallback to hardcoded |
+| `/api/package` | GET | Application metadata — DAR package ID, template list, operator party |
+| `/api/positions` | GET/POST | Position CRUD (KV-backed fallback when Canton unavailable) |
+| `/api/invitations` | GET/POST | Invitation management (KV-backed fallback) |
+| `/api/escrow/deploy` | GET/POST | Deploy VaultEscrow contracts using platform deployer private key |
+| `/api/escrow/balances` | GET | Read on-chain ETH + USDC balances for an escrow address |
+| `/api/custodian/accept-deposit` | POST | Accept CC transfer offers on custodian's behalf via Splice API |
+| `/api/custodian/withdraw` | POST | Create CC transfer from custodian to user via Splice API |
+| `/api/admin/provision-custodian` | GET/POST | Provision dedicated vault-custodian Canton party |
+
+### Escrow Deployment Details
+
+`/api/escrow/deploy` uses a platform-owned deployer EOA (private key stored as Cloudflare secret `DEPLOYER_PRIVATE_KEY`). The deployer pays gas fees. Constructor parameters (owner address, liquidator address, chain-specific Uniswap/WETH/USDC addresses) are derived from the request and chain configuration. Authentication: same-origin trusted, cross-origin requires `X-Api-Secret` header.
+
+### Custodian Provisioning
+
+`/api/admin/provision-custodian` creates a headless "vault-custodian" party on Canton via the Splice validator admin API. This party holds CC on behalf of all vaults. The operator's user account is granted `actAs`/`readAs` rights for the custodian party via Canton JSON API user management (HS256 JWT authentication with `CANTON_AUTH_SECRET`).
+
+---
+
+## Frontend Pages
+
+| Page | Route | Roles | Description |
+|------|-------|-------|-------------|
+| **Dashboard** | `/` | All | Role-specific overview with stats, ZK proof status, margin call alerts |
+| **Vaults** | `/vaults` | Fund | Create vaults, deposit/withdraw assets, deploy escrows, sync balances |
+| **Positions** | `/positions` | Fund, Broker | Open/close/liquidate positions, detail dialog with liquidation breakdown |
+| **My Brokers** | `/brokers` | Fund | View broker links, respond to invitations and LTV proposals |
+| **Client Accounts** | `/funds` | Broker | Manage fund links, set thresholds and allowed assets |
+| **Margin** | `/margin` | Fund, Broker | Margin verification with ZK proof generation |
+| **Admin** | `/admin` | Operator | Role management, platform asset config, custodian/deployer provisioning |
+
+### Dashboard Highlights
+
+**Fund Dashboard**: Total assets value, capital protection status, open positions count, pending margin calls. Displays real ZK proof hash and what is disclosed vs. hidden from counterparties.
+
+**Broker Dashboard**: Client fund count, total collateral (shown as "Encrypted" — only ZK-verified), active margin calls, tracked positions. Shows ZK verification status per fund.
+
+**Operator Dashboard**: Party counts, custodian provisioning panel, deployer EOA configuration, role management navigation.
+
+### Position Detail Dialog
+
+Clicking any position row opens a modal showing full details:
+- **All statuses**: Position ID, direction (Long/Short), vault ID, fund, broker, timestamps
+- **Open/MarginCalled**: Notional, collateral, entry price, units, unrealized PnL (green/red), LTV progress bar with threshold marker, margin call warning banner
+- **Liquidated**: Complete liquidation breakdown — per-chain escrow seizures table (chain, address, ETH seized, USDC seized, tx hashes), CC assets seized table, broker recipient, total seized amount
+- **Closed**: Final notional value and PnL
+
+---
+
+## Chain Support
+
+| Chain | ID | Mode | USDC Address | Uniswap V3 |
+|-------|----|------|-------------|-------------|
+| Ethereum | 1 | Mainnet | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` | `0xE592427A0AEce92De3Edee1F18E0157C05861564` |
+| Sepolia | 11155111 | Testnet | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` | `0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E` |
+| Base | 8453 | Mainnet | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | `0x2626664c2603336E57B271c5C0b26F421741e481` |
+| Base Sepolia | 84532 | Testnet | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` | `0x94cC0AaC535CCDB3C01d6787D6413C739ae12bc4` |
+| Canton | — | — | — | CC via Splice validator |
+
+Network mode is controlled by `VITE_NETWORK_MODE` environment variable (`testnet` or `mainnet`). In testnet mode, chain name "Ethereum" maps to Sepolia, "Base" maps to Base Sepolia.
+
+---
+
+## Build & Deploy
 
 ### Prerequisites
 
 - Node.js 18+
-- Daml SDK (for building the DAR package)
-- Stratos Wallet SDK (local package)
+- Daml SDK 3.4.9 (for DAR compilation)
+- Cloudflare account with Wrangler CLI (for deployment)
+- `@stratos-wallet/sdk` (local linked package at `../stratos-wallet-sdk`)
 
-### Build
+### Install Dependencies
 
 ```bash
 npm install
-npm run build:dar      # Compile Daml contracts
-npm run copy-dar       # Copy DAR to public/
-npm run build          # TypeScript + Vite production build
 ```
 
-### Compile Solidity Contracts
+### Build Daml Package
 
 ```bash
-npx solcjs --bin --abi --optimize contracts/VaultEscrow.sol -o contracts/build/
-npx solcjs --bin --abi --optimize contracts/DepositRelay.sol -o contracts/build/
+npm run build:dar
 ```
+
+Compiles Daml sources in `daml/src/`, updates `PACKAGE_ID` in `wrangler.toml` to the new DAR hash, and copies the DAR file to `public/package.dar`.
+
+### Build ZK Circuit (optional — artifacts may be pre-built)
+
+```bash
+npm run build:zk
+```
+
+Requires `circom2` (installed via npm devDependencies). Runs the full trusted setup ceremony and outputs WASM, zkey, and verification key to `public/zk/`.
 
 ### Development Server
 
@@ -110,14 +774,111 @@ npx solcjs --bin --abi --optimize contracts/DepositRelay.sol -o contracts/build/
 npm run dev
 ```
 
-### Deploy
+Starts Vite dev server on port 5175.
+
+### Production Build
 
 ```bash
-npm run deploy         # Deploy to Cloudflare Pages
+npm run build
+```
+
+Runs `copy-dar` → TypeScript compilation → Vite build. Output in `dist/`.
+
+### Deploy to Cloudflare Pages
+
+```bash
+npm run deploy
+```
+
+Requires Cloudflare Wrangler authentication. Set secrets:
+
+```bash
+wrangler pages secret put DEPLOYER_PRIVATE_KEY   # Hex-encoded EOA private key for escrow deployment
+wrangler pages secret put API_SECRET              # Shared secret for cross-origin API auth
 ```
 
 ### Type Check
 
 ```bash
-npm run lint
+npm run lint    # runs tsc --noEmit
+```
+
+### Configuration (`wrangler.toml`)
+
+| Variable | Description |
+|----------|-------------|
+| `PACKAGE_ID` | Daml DAR package hash (auto-updated by `build:dar`) |
+| `COINMARKETCAP_API_KEY` | CoinMarketCap API key for live price feeds |
+| `RPC_SEPOLIA` / `RPC_BASE_SEPOLIA` | Testnet EVM RPC endpoints |
+| `RPC_ETHEREUM` / `RPC_BASE` | Mainnet EVM RPC endpoints |
+| `SPLICE_HOST` / `SPLICE_PORT` | Canton/Splice validator host and port |
+| `CANTON_AUTH_SECRET` | HS256 secret for Canton JSON API JWT authentication |
+| `CANTON_AUTH_AUDIENCE` | JWT audience claim for Canton auth |
+| `CUSTODIAN_USER` | Headless custodian user ID on Canton |
+
+### Key Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `@stratos-wallet/sdk` | Canton Network wallet SDK (local link) |
+| `snarkjs` | Groth16 ZK proof generation/verification (in-browser WASM) |
+| `viem` | EVM contract deployment and chain interaction |
+| `react` / `react-dom` | UI framework (v19) |
+| `@mui/material` | Material UI component library |
+| `recharts` | Dashboard data visualization charts |
+| `react-router-dom` | Client-side routing (HashRouter) |
+| `circom2` / `circomlib` | ZK circuit compilation (dev only) |
+| `solc` | Solidity contract compilation (dev only) |
+| `wrangler` | Cloudflare Pages deployment CLI (dev only) |
+
+### Project Structure
+
+```
+stratos-privamargin/
+├── circuits/
+│   ├── ltv_verifier.circom    # ZK circuit (Groth16, 10 assets)
+│   └── build.sh               # Trusted setup + artifact generation
+├── contracts/
+│   └── VaultEscrow.sol        # Per-vault EVM escrow contract
+├── daml/
+│   ├── daml.yaml              # Daml SDK config (3.4.9, Canton 2.1)
+│   └── src/
+│       ├── Assets.daml        # TokenizedAsset, AssetIssuance
+│       ├── BrokerFundLink.daml # Invitations, links, LTV proposals
+│       ├── CollateralLock.daml # Self-custody CC pledges
+│       ├── CollateralVault.daml # Vault with multi-chain escrows
+│       ├── MarginVerification.daml # Margin calls, settlements
+│       ├── Position.daml      # Trading positions with PnL
+│       └── Roles.daml         # Operator, broker, fund roles
+├── functions/api/             # Cloudflare Pages Functions
+│   ├── config.ts              # Platform configuration
+│   ├── prices.ts              # Live asset prices
+│   ├── roles.ts               # Role assignment
+│   ├── positions.ts           # Position CRUD (KV fallback)
+│   ├── invitations.ts         # Invitation management
+│   ├── package.ts             # App metadata
+│   ├── escrow/
+│   │   ├── deploy.ts          # VaultEscrow deployment
+│   │   └── balances.ts        # On-chain balance reads
+│   ├── custodian/
+│   │   ├── accept-deposit.ts  # Accept CC transfer offers
+│   │   └── withdraw.ts        # Create CC transfer offers
+│   └── admin/
+│       └── provision-custodian.ts # Canton custodian party setup
+├── public/
+│   ├── package.dar            # Compiled Daml package
+│   └── zk/                    # ZK circuit artifacts (WASM, zkey, vkey)
+├── src/
+│   ├── App.tsx                # Shell, routing, role gate
+│   ├── pages/
+│   │   ├── Dashboard.tsx      # Role-specific dashboards
+│   │   ├── Positions.tsx      # Position management + detail dialog
+│   │   └── VaultManagement.tsx # Vault lifecycle management
+│   └── services/
+│       ├── api.ts             # Core API layer (~2800 lines)
+│       ├── evmEscrow.ts       # EVM ABI encoding + chain config
+│       └── zkProof.ts         # Groth16 proof generation/verification
+├── package.json
+├── vite.config.ts             # Vite config (port 5175)
+└── wrangler.toml              # Cloudflare Pages config + env vars
 ```
