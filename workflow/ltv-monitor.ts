@@ -283,6 +283,30 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
 
     if (positions.length === 0) {
       console.log('No open positions to monitor');
+
+      // Still persist a run record so operator dashboard shows activity
+      const emptyTimestamp = new Date().toISOString();
+      await step.do('persist-empty-run-record', async () => {
+        const runRecord = {
+          timestamp: emptyTimestamp,
+          processed: 0,
+          marginCallsCreated: 0,
+          positions: [],
+          prices: {},
+        };
+        await env.PRIVAMARGIN_CONFIG.put(
+          `workflow:run:${emptyTimestamp}`,
+          JSON.stringify(runRecord),
+          { expirationTtl: 30 * 24 * 60 * 60 }
+        );
+        const indexRaw = await env.PRIVAMARGIN_CONFIG.get('workflow:runs:index');
+        const index: string[] = indexRaw ? JSON.parse(indexRaw) : [];
+        index.push(emptyTimestamp);
+        if (index.length > 100) index.splice(0, index.length - 100);
+        await env.PRIVAMARGIN_CONFIG.put('workflow:runs:index', JSON.stringify(index));
+        console.log(`Persisted empty run record: ${emptyTimestamp}`);
+      });
+
       return { processed: 0, marginCallsCreated: 0 };
     }
 
