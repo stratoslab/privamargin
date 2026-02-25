@@ -1041,8 +1041,8 @@ function WorkflowLogPanel() {
                           {autoLiqs}
                         </Typography>
                       </TableCell>
-                      <TableCell sx={tdSx} align="right">${run.prices.CC.toFixed(2)}</TableCell>
-                      <TableCell sx={tdSx} align="right">${run.prices.ETH.toLocaleString()}</TableCell>
+                      <TableCell sx={tdSx} align="right">${(run.prices?.CC ?? 0).toFixed(2)}</TableCell>
+                      <TableCell sx={tdSx} align="right">${(run.prices?.ETH ?? 0).toLocaleString()}</TableCell>
                     </TableRow>
 
                     {/* Expanded detail sub-table */}
