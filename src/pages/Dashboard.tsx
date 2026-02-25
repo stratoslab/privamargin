@@ -1,6 +1,13 @@
-import { useState, useEffect } from 'react';
-import { Box, Typography, Button, Grid, CircularProgress, Alert } from '@mui/material';
-import { Add, Visibility, VisibilityOff, Lock, LockOpen, TrendingUp, Warning, Shield } from '@mui/icons-material';
+import { useState, useEffect, Fragment } from 'react';
+import {
+  Box, Typography, Button, Grid, CircularProgress, Alert,
+  Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
+  Collapse, IconButton, Chip,
+} from '@mui/material';
+import {
+  Add, Visibility, VisibilityOff, Lock, LockOpen, TrendingUp, Warning, Shield,
+  Schedule, ExpandMore, ExpandLess, CheckCircle, Warning as WarningIcon,
+} from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 import { vaultAPI, marginAPI, invitationAPI, positionAPI, linkAPI, workflowMarginCallAPI, getCustodianParty } from '../services/api';
 import type { PositionData, BrokerFundLinkData, WorkflowMarginCallData } from '../services/api';
@@ -832,6 +839,277 @@ function DeployerPanel() {
   );
 }
 
+// Workflow run record shape from KV
+interface WorkflowRunRecord {
+  timestamp: string;
+  processed: number;
+  marginCallsCreated: number;
+  positions: Array<{
+    positionId: string;
+    vaultId: string;
+    fund: string;
+    broker: string;
+    notional: number;
+    collateralValue: number;
+    pnl: number;
+    currentLTV: number;
+    breached: boolean;
+    autoLiquidated: boolean;
+  }>;
+  prices: { CC: number; ETH: number; BTC: number; USDC: number; SOL: number };
+}
+
+// Workflow Monitor Panel — shows recent LTV monitor workflow runs
+function WorkflowLogPanel() {
+  const [runs, setRuns] = useState<WorkflowRunRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [expandedRow, setExpandedRow] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/workflow/history?limit=20');
+        const data = await res.json() as { runs: WorkflowRunRecord[] };
+        setRuns(data.runs || []);
+      } catch {
+        // ignore
+      }
+      setLoading(false);
+    })();
+  }, []);
+
+  const thSx = {
+    color: 'rgba(255,255,255,0.5)',
+    fontSize: 11,
+    fontWeight: 600,
+    borderBottom: '1px solid rgba(255,255,255,0.06)',
+    textTransform: 'uppercase' as const,
+    letterSpacing: 0.5,
+    py: 1.5,
+    px: 1.5,
+    whiteSpace: 'nowrap' as const,
+  };
+
+  const tdSx = {
+    color: 'white',
+    fontSize: 13,
+    borderBottom: '1px solid rgba(255,255,255,0.04)',
+    py: 1.5,
+    px: 1.5,
+  };
+
+  const latestRun = runs[0];
+  const latestTime = latestRun
+    ? new Date(latestRun.timestamp).toLocaleString()
+    : '—';
+
+  const rowColor = (run: WorkflowRunRecord) => {
+    if (run.positions.some(p => p.autoLiquidated)) return 'rgba(239, 68, 68, 0.06)';
+    if (run.marginCallsCreated > 0) return 'rgba(245, 158, 11, 0.06)';
+    return 'transparent';
+  };
+
+  return (
+    <Box
+      sx={{
+        bgcolor: '#111820',
+        borderRadius: '12px',
+        border: '1px solid rgba(255,255,255,0.06)',
+        p: 3,
+        mb: 3,
+      }}
+    >
+      {/* Header */}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
+        <Box
+          sx={{
+            width: 40,
+            height: 40,
+            borderRadius: '10px',
+            bgcolor: 'rgba(245,158,11,0.1)',
+            border: '2px solid #f59e0b',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <Schedule sx={{ color: '#f59e0b', fontSize: 20 }} />
+        </Box>
+        <Box sx={{ flex: 1 }}>
+          <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'white' }}>Workflow Monitor</Typography>
+          <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>LTV check runs every 15 minutes</Typography>
+        </Box>
+        {latestRun && (
+          <Chip
+            label={`Last: ${latestTime}`}
+            size="small"
+            sx={{
+              bgcolor: 'rgba(245,158,11,0.1)',
+              color: '#f59e0b',
+              fontSize: 11,
+              fontWeight: 500,
+              border: '1px solid rgba(245,158,11,0.2)',
+            }}
+          />
+        )}
+      </Box>
+
+      {/* Summary stats */}
+      {latestRun && (
+        <Box sx={{ display: 'flex', gap: 2, mb: 2.5 }}>
+          <Box sx={{ flex: 1, bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 1.5, textAlign: 'center' }}>
+            <Typography sx={{ fontSize: 20, fontWeight: 600, color: 'white' }}>{latestRun.processed}</Typography>
+            <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>Positions Processed</Typography>
+          </Box>
+          <Box sx={{ flex: 1, bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 1.5, textAlign: 'center' }}>
+            <Typography sx={{ fontSize: 20, fontWeight: 600, color: latestRun.marginCallsCreated > 0 ? '#ef4444' : 'white' }}>
+              {latestRun.marginCallsCreated}
+            </Typography>
+            <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>Margin Calls</Typography>
+          </Box>
+          <Box sx={{ flex: 1, bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 1.5, textAlign: 'center' }}>
+            <Typography sx={{ fontSize: 20, fontWeight: 600, color: 'white' }}>
+              {new Date(latestRun.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </Typography>
+            <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>Last Run</Typography>
+          </Box>
+        </Box>
+      )}
+
+      {/* Table */}
+      {loading ? (
+        <Box sx={{ textAlign: 'center', py: 4 }}>
+          <CircularProgress size={24} sx={{ color: 'rgba(255,255,255,0.3)' }} />
+        </Box>
+      ) : runs.length === 0 ? (
+        <Box sx={{ textAlign: 'center', py: 4 }}>
+          <Schedule sx={{ fontSize: 32, color: 'rgba(255,255,255,0.15)', mb: 1 }} />
+          <Typography sx={{ fontSize: 14, color: 'rgba(255,255,255,0.5)' }}>No workflow runs recorded yet</Typography>
+          <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.3)', mt: 0.5 }}>
+            Records appear after the next scheduled LTV check
+          </Typography>
+        </Box>
+      ) : (
+        <TableContainer>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell sx={{ ...thSx, width: 32 }} />
+                <TableCell sx={thSx}>Time</TableCell>
+                <TableCell sx={thSx} align="right">Positions</TableCell>
+                <TableCell sx={thSx} align="right">Margin Calls</TableCell>
+                <TableCell sx={thSx} align="right">Breaches</TableCell>
+                <TableCell sx={thSx} align="right">Auto-Liq</TableCell>
+                <TableCell sx={thSx} align="right">CC Price</TableCell>
+                <TableCell sx={thSx} align="right">ETH Price</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {runs.map((run) => {
+                const isExpanded = expandedRow === run.timestamp;
+                const breaches = run.positions.filter(p => p.breached).length;
+                const autoLiqs = run.positions.filter(p => p.autoLiquidated).length;
+
+                return (
+                  <Fragment key={run.timestamp}>
+                    <TableRow
+                      hover
+                      onClick={() => setExpandedRow(isExpanded ? null : run.timestamp)}
+                      sx={{ cursor: 'pointer', bgcolor: rowColor(run), '&:hover': { bgcolor: 'rgba(255,255,255,0.03)' } }}
+                    >
+                      <TableCell sx={{ ...tdSx, px: 0.5 }}>
+                        <IconButton size="small" sx={{ color: 'rgba(255,255,255,0.4)' }}>
+                          {isExpanded ? <ExpandLess fontSize="small" /> : <ExpandMore fontSize="small" />}
+                        </IconButton>
+                      </TableCell>
+                      <TableCell sx={tdSx}>
+                        {new Date(run.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                      </TableCell>
+                      <TableCell sx={tdSx} align="right">{run.processed}</TableCell>
+                      <TableCell sx={tdSx} align="right">
+                        <Typography component="span" sx={{ color: run.marginCallsCreated > 0 ? '#ef4444' : 'rgba(255,255,255,0.5)', fontSize: 13 }}>
+                          {run.marginCallsCreated}
+                        </Typography>
+                      </TableCell>
+                      <TableCell sx={tdSx} align="right">
+                        <Typography component="span" sx={{ color: breaches > 0 ? '#f59e0b' : 'rgba(255,255,255,0.5)', fontSize: 13 }}>
+                          {breaches}
+                        </Typography>
+                      </TableCell>
+                      <TableCell sx={tdSx} align="right">
+                        <Typography component="span" sx={{ color: autoLiqs > 0 ? '#ef4444' : 'rgba(255,255,255,0.5)', fontSize: 13 }}>
+                          {autoLiqs}
+                        </Typography>
+                      </TableCell>
+                      <TableCell sx={tdSx} align="right">${run.prices.CC.toFixed(2)}</TableCell>
+                      <TableCell sx={tdSx} align="right">${run.prices.ETH.toLocaleString()}</TableCell>
+                    </TableRow>
+
+                    {/* Expanded detail sub-table */}
+                    <TableRow>
+                      <TableCell sx={{ py: 0, borderBottom: 'none' }} colSpan={8}>
+                        <Collapse in={isExpanded} timeout="auto" unmountOnExit>
+                          <Box sx={{ py: 1.5, px: 1 }}>
+                            <Table size="small">
+                              <TableHead>
+                                <TableRow>
+                                  <TableCell sx={{ ...thSx, fontSize: 10 }}>Position ID</TableCell>
+                                  <TableCell sx={{ ...thSx, fontSize: 10 }}>Fund</TableCell>
+                                  <TableCell sx={{ ...thSx, fontSize: 10 }} align="right">Notional</TableCell>
+                                  <TableCell sx={{ ...thSx, fontSize: 10 }} align="right">Collateral</TableCell>
+                                  <TableCell sx={{ ...thSx, fontSize: 10 }} align="right">PnL</TableCell>
+                                  <TableCell sx={{ ...thSx, fontSize: 10 }} align="right">LTV</TableCell>
+                                  <TableCell sx={{ ...thSx, fontSize: 10 }} align="center">Status</TableCell>
+                                </TableRow>
+                              </TableHead>
+                              <TableBody>
+                                {run.positions.map((pos) => (
+                                  <TableRow key={pos.positionId}>
+                                    <TableCell sx={{ ...tdSx, fontSize: 12, fontFamily: 'monospace' }}>{pos.positionId}</TableCell>
+                                    <TableCell sx={{ ...tdSx, fontSize: 12 }} title={pos.fund}>
+                                      {pos.fund.length > 20 ? `${pos.fund.slice(0, 8)}...${pos.fund.slice(-8)}` : pos.fund}
+                                    </TableCell>
+                                    <TableCell sx={{ ...tdSx, fontSize: 12 }} align="right">
+                                      ${pos.notional.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                                    </TableCell>
+                                    <TableCell sx={{ ...tdSx, fontSize: 12 }} align="right">
+                                      ${pos.collateralValue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                                    </TableCell>
+                                    <TableCell sx={{ ...tdSx, fontSize: 12, color: pos.pnl >= 0 ? '#00d4aa' : '#ef4444' }} align="right">
+                                      {pos.pnl >= 0 ? '+' : ''}${pos.pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                                    </TableCell>
+                                    <TableCell sx={{ ...tdSx, fontSize: 12, color: pos.currentLTV >= 0.8 ? '#ef4444' : pos.currentLTV >= 0.6 ? '#f59e0b' : '#00d4aa' }} align="right">
+                                      {(pos.currentLTV * 100).toFixed(1)}%
+                                    </TableCell>
+                                    <TableCell sx={{ ...tdSx, fontSize: 12 }} align="center">
+                                      {pos.autoLiquidated ? (
+                                        <Chip label="Liquidated" size="small" sx={{ bgcolor: 'rgba(239,68,68,0.15)', color: '#ef4444', fontSize: 10, height: 20 }} />
+                                      ) : pos.breached ? (
+                                        <Chip label="Breached" size="small" icon={<WarningIcon sx={{ fontSize: '12px !important', color: '#f59e0b !important' }} />} sx={{ bgcolor: 'rgba(245,158,11,0.15)', color: '#f59e0b', fontSize: 10, height: 20 }} />
+                                      ) : (
+                                        <Chip label="OK" size="small" icon={<CheckCircle sx={{ fontSize: '12px !important', color: '#00d4aa !important' }} />} sx={{ bgcolor: 'rgba(0,212,170,0.1)', color: '#00d4aa', fontSize: 10, height: 20 }} />
+                                      )}
+                                    </TableCell>
+                                  </TableRow>
+                                ))}
+                              </TableBody>
+                            </Table>
+                          </Box>
+                        </Collapse>
+                      </TableCell>
+                    </TableRow>
+                  </Fragment>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
+    </Box>
+  );
+}
+
+
 // Operator Dashboard — platform overview with role counts and system status
 function OperatorDashboard({ user }: { user: AuthUser }) {
   const { allRoles } = useRole();
@@ -915,6 +1193,9 @@ function OperatorDashboard({ user }: { user: AuthUser }) {
 
       {/* Deployer Panel */}
       <DeployerPanel />
+
+      {/* Workflow Monitor */}
+      <WorkflowLogPanel />
 
       {/* Connected as */}
       <Box

@@ -16,6 +16,8 @@ PrivaMargin enables hedge funds to prove margin sufficiency to prime brokers usi
 - [Liquidation Workflow](#liquidation-workflow)
 - [Broker-Fund Relationships](#broker-fund-relationships)
 - [Margin Verification](#margin-verification)
+- [LTV Monitor Workflow](#ltv-monitor-workflow)
+- [Auto-Liquidate Preference](#auto-liquidate-preference)
 - [API Layer](#api-layer)
 - [Cloudflare Pages Functions](#cloudflare-pages-functions)
 - [Frontend Pages](#frontend-pages)
@@ -39,6 +41,12 @@ PrivaMargin enables hedge funds to prove margin sufficiency to prime brokers usi
 │              Cloudflare Pages Functions                   │
 │  /api/config · /api/prices · /api/escrow/deploy          │
 │  /api/escrow/balances · /api/custodian/*  · /api/roles   │
+│  /api/auto-liquidate                                      │
+├──────────────────────────────────────────────────────────┤
+│              Cloudflare Workflow Worker                    │
+│  LTV Monitor (cron: every 15 min)                         │
+│  Reads: Canton positions/vaults/links + KV auto-liq prefs │
+│  Writes: margin calls, position updates, auto-liquidation │
 ├─────────────────────────┬───────────────────────────────┤
 │     Canton Network      │        EVM Chains              │
 │  (Daml ledger)          │  (Ethereum, Base)              │
@@ -575,6 +583,8 @@ Each `BrokerFundLink` defines:
 - **Allowed Assets** — symbols the fund can trade (e.g., BTC, ETH, SOL, CC, USDC)
 - **Allowed Collaterals** — symbols the fund can deposit as collateral
 
+**Auto-Liquidate** is a broker-side operational preference stored off-ledger in Cloudflare KV (not on the Daml contract). See [Auto-Liquidate Preference](#auto-liquidate-preference).
+
 ### LTV Threshold Changes
 
 Brokers can propose threshold changes via `ProposeLTVChange`. This creates an `LTVChangeProposal` that the fund must accept or reject:
@@ -622,6 +632,157 @@ When ZK artifacts are available, margin verification generates a real Groth16 pr
 | Margin sufficiency | Yes | Yes ("Sufficient" / "Insufficient") |
 | Position notional | Yes | Yes (public ZK input) |
 | LTV threshold | Yes | Yes (public ZK input) |
+
+---
+
+## LTV Monitor Workflow
+
+A Cloudflare Workflow Worker (`workflow/ltv-monitor.ts`) runs on a 15-minute cron schedule to automatically monitor all open positions and take action when LTV thresholds are breached.
+
+### Workflow Steps
+
+```
+Step 1: fetch-positions
+  │  Query Canton for all Position contracts with status = "Open"
+  │
+Step 2: fetch-vault-values
+  │  Query Canton for CollateralVault contracts for each unique vaultId
+  │
+Step 3: fetch-live-prices
+  │  Fetch live prices from CoinMarketCap (fallback to hardcoded)
+  │
+Step 4: compute-ltvs
+  │  For each position:
+  │    - Calculate unrealized PnL (Long: units × (current - entry), Short: reverse)
+  │    - Aggregate notional + PnL per vault
+  │    - LTV = aggregate notional / (collateral + aggregate PnL)
+  │
+Step 5: fetch-thresholds
+  │  Query Canton BrokerFundLink contracts for each broker-fund pair
+  │  Returns: Record<"broker|fund", threshold>
+  │
+Step 5b: fetch-auto-liquidate-prefs
+  │  Read KV keys (auto_liquidate:<broker>|<fund>) for each pair
+  │  Returns: Record<"broker|fund", boolean>
+  │
+Step 6: margin-call-<positionId>  (for each breached position)
+  │  If LTV >= threshold:
+  │    - Create WorkflowMarginCall on Canton
+  │    - Exercise MarkMarginCalled on the position
+  │    - If auto-liquidate flag is true:
+  │        1. Execute collateral seizure (workflow/liquidation.ts):
+  │           a. Calculate liquidation amount = min(|PnL|, collateralValue)
+  │           b. Inventory EVM escrow balances (ETH, USDC per chain)
+  │           c. Inventory Canton-native assets (CC, CUSDC)
+  │           d. Greedy waterfall: seize stablecoins first → CC → ETH
+  │           e. EVM: call liquidateERC20/liquidate on escrow contracts
+  │           f. Canton: transfer CC from custodian to broker via Splice
+  │        2. Exercise LiquidatePosition on Canton with seized amount
+  │
+Step 7: update-ltv-<positionId>  (for each non-breached position)
+     Update position's LTV on Canton with fresh values
+```
+
+### Decision Logic Per Position
+
+```
+LTV >= threshold?
+  ├─ YES → Create margin call
+  │         └─ Auto-liquidate enabled in KV?
+  │              ├─ YES → Execute real collateral seizure:
+  │              │         1. Read EVM escrow balances (ETH + USDC)
+  │              │         2. Read Canton vault assets (CC, CUSDC)
+  │              │         3. Seize in priority order (USDC → CUSDC → CC → ETH)
+  │              │         4. EVM: liquidateERC20/liquidate via deployer key
+  │              │         5. Canton: Splice transfer from custodian to broker
+  │              │         6. Exercise LiquidatePosition on Canton
+  │              └─ NO  → Wait for manual intervention
+  └─ NO  → Update LTV on Canton (keeps UI fresh)
+```
+
+### Configuration
+
+| Setting | Location | Description |
+|---------|----------|-------------|
+| Cron schedule | `workflow/wrangler.toml` | `*/15 * * * *` (every 15 minutes) |
+| Canton host | `workflow/wrangler.toml` vars | `CANTON_HOST` — Canton JSON API endpoint |
+| Package ID | `workflow/wrangler.toml` vars | `PACKAGE_ID` — Daml DAR package hash |
+| CMC API key | `workflow/wrangler.toml` vars | `COINMARKETCAP_API_KEY` — for live prices |
+| RPC endpoints | `workflow/wrangler.toml` vars | `RPC_SEPOLIA`, `RPC_BASE_SEPOLIA`, `RPC_ETHEREUM`, `RPC_BASE` |
+| Network mode | `workflow/wrangler.toml` vars | `NETWORK_MODE` — `testnet` or `mainnet` |
+| Splice host | `workflow/wrangler.toml` vars | `SPLICE_HOST`, `SPLICE_PORT` — Splice validator API |
+| Canton auth | `workflow/wrangler.toml` vars | `CANTON_AUTH_AUDIENCE`, `CUSTODIAN_USER` |
+| Auth token | Wrangler secret | `CANTON_AUTH_TOKEN` — Canton bearer token |
+| Operator party | Wrangler secret | `OPERATOR_PARTY` — Canton operator party ID |
+| Deployer key | Wrangler secret | `DEPLOYER_PRIVATE_KEY` — EVM liquidator private key |
+| Canton auth secret | Wrangler secret | `CANTON_AUTH_SECRET` — HS256 secret for Splice JWT |
+| Auto-liquidate | KV namespace | `PRIVAMARGIN_CONFIG` — per broker-fund pair |
+
+### Manual Trigger
+
+The workflow exposes HTTP endpoints for manual operation:
+
+```bash
+# Trigger a run
+curl -X POST https://<worker-url>/run
+
+# Check status
+curl https://<worker-url>/status?id=<instance-id>
+```
+
+### Deploy
+
+```bash
+cd workflow
+wrangler deploy
+```
+
+Set secrets before first deploy:
+```bash
+wrangler secret put CANTON_AUTH_TOKEN
+wrangler secret put OPERATOR_PARTY
+wrangler secret put DEPLOYER_PRIVATE_KEY
+wrangler secret put CANTON_AUTH_SECRET
+```
+
+---
+
+## Auto-Liquidate Preference
+
+Auto-liquidation is a **broker-side operational choice**, not a contractual term. It controls whether the LTV Monitor Workflow automatically liquidates positions when LTV exceeds the threshold, or just creates a margin call for manual handling.
+
+When enabled, auto-liquidation triggers **real collateral seizure** — EVM escrow assets (ETH, USDC) are seized via the liquidator private key on-chain, and Canton-native assets (CC, CUSDC) are transferred from the custodian party to the broker via the Splice API. The position is then marked `Liquidated` on Canton.
+
+### Storage
+
+Preferences are stored in Cloudflare KV (`PRIVAMARGIN_CONFIG` namespace) with keys:
+
+```
+auto_liquidate:<broker-party-id>|<fund-party-id> = "true" | "false"
+```
+
+### Why KV (Not Daml)
+
+The LTV threshold is a contractual term agreed upon by both broker and fund (stored on `BrokerFundLink`). Auto-liquidation, however, is a unilateral broker preference — the fund doesn't need to consent to how the broker handles breaches. Storing it off-ledger in KV:
+- Avoids unnecessary contract exercises for a non-contractual setting
+- Allows instant toggling without Daml transaction overhead
+- Keeps the `BrokerFundLink` contract focused on mutual agreements
+
+### API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/auto-liquidate?broker=X&fund=Y` | GET | Single pair lookup → `{ enabled: boolean }` |
+| `/api/auto-liquidate?broker=X` | GET | All preferences for a broker → `{ preferences: Record<fund, boolean> }` |
+| `/api/auto-liquidate` | POST | Set preference → `{ broker, fund, enabled }` |
+
+### Consumer
+
+The LTV Monitor Workflow reads auto-liquidate preferences from KV in step 5b (`fetch-auto-liquidate-prefs`). If the flag is `true` for a broker-fund pair and a position breaches the threshold, the workflow executes full collateral seizure via `workflow/liquidation.ts` (EVM escrow liquidation + Splice CC transfer), then exercises `LiquidatePosition` on Canton with the total seized amount.
+
+### UI
+
+The broker's "Client Accounts" page (`BrokerFundLinks.tsx`) shows a toggle switch per linked fund. The toggle reads from `linkAPI.getAutoLiquidatePrefs(broker)` and writes via `linkAPI.setAutoLiquidate(broker, fund, enabled)`.
 
 ---
 
@@ -681,6 +842,8 @@ Serverless API endpoints deployed alongside the frontend. Use Cloudflare KV (`PR
 | `/api/escrow/balances` | GET | Read on-chain ETH + USDC balances for an escrow address |
 | `/api/custodian/accept-deposit` | POST | Accept CC transfer offers on custodian's behalf via Splice API |
 | `/api/custodian/withdraw` | POST | Create CC transfer from custodian to user via Splice API |
+| `/api/auto-liquidate` | GET/POST | Broker auto-liquidate preferences per fund (KV-backed) |
+| `/api/workflow/history` | GET | Workflow run history — list recent runs or fetch single run by timestamp |
 | `/api/admin/provision-custodian` | GET/POST | Provision dedicated vault-custodian Canton party |
 
 ### Escrow Deployment Details
@@ -711,7 +874,7 @@ Serverless API endpoints deployed alongside the frontend. Use Cloudflare KV (`PR
 
 **Broker Dashboard**: Client fund count, total collateral (shown as "Encrypted" — only ZK-verified), active margin calls, tracked positions. Shows ZK verification status per fund.
 
-**Operator Dashboard**: Party counts, custodian provisioning panel, deployer EOA configuration, role management navigation.
+**Operator Dashboard**: Party counts, custodian provisioning panel, deployer EOA configuration, Workflow Monitor panel (recent LTV check runs with per-position detail), role management navigation.
 
 ### Position Detail Dialog
 
@@ -852,6 +1015,9 @@ stratos-privamargin/
 │       └── Roles.daml         # Operator, broker, fund roles
 ├── functions/api/             # Cloudflare Pages Functions
 │   ├── config.ts              # Platform configuration
+│   ├── auto-liquidate.ts      # Broker auto-liquidate prefs (KV)
+│   ├── workflow/
+│   │   └── history.ts         # Workflow run history (KV-backed)
 │   ├── prices.ts              # Live asset prices
 │   ├── roles.ts               # Role assignment
 │   ├── positions.ts           # Position CRUD (KV fallback)
@@ -878,6 +1044,9 @@ stratos-privamargin/
 │       ├── api.ts             # Core API layer (~2800 lines)
 │       ├── evmEscrow.ts       # EVM ABI encoding + chain config
 │       └── zkProof.ts         # Groth16 proof generation/verification
+├── workflow/
+│   ├── wrangler.toml          # Workflow worker config (cron, KV binding)
+│   └── ltv-monitor.ts         # LTV Monitor Workflow (every 15 min)
 ├── package.json
 ├── vite.config.ts             # Vite config (port 5175)
 └── wrangler.toml              # Cloudflare Pages config + env vars

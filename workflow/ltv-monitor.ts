@@ -16,12 +16,15 @@ import {
   WorkflowEvent,
 } from 'cloudflare:workers';
 
-interface Env {
+import { executeLiquidation, type LiquidationEnv } from './liquidation';
+
+interface Env extends LiquidationEnv {
   CANTON_HOST: string;
   CANTON_AUTH_TOKEN: string;
   OPERATOR_PARTY: string;
   PACKAGE_ID: string;
   COINMARKETCAP_API_KEY: string;
+  PRIVAMARGIN_CONFIG: KVNamespace;
   LTV_MONITOR_WORKFLOW: Workflow;
 }
 
@@ -59,6 +62,7 @@ interface VaultContract {
       valueUSD: string;
     }>;
     linkedPositions: string[];
+    chainVaults?: Array<[string, string]> | Array<{ _1: string; _2: string }> | null;
   };
 }
 
@@ -370,10 +374,21 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
           const link = results[0] as LinkContract;
           thresholdMap[pair] = parseFloat(link.payload.ltvThreshold) || 0.8;
         } else {
-          thresholdMap[pair] = 0.8; // default
+          thresholdMap[pair] = 0.8;
         }
       }
       return thresholdMap;
+    });
+
+    // Step 5b: Fetch auto-liquidate preferences from KV
+    const autoLiqFlags = await step.do('fetch-auto-liquidate-prefs', async () => {
+      const flagMap: Record<string, boolean> = {};
+      for (const pair of brokerFundPairs) {
+        const [broker, fund] = pair.split('|');
+        const value = await env.PRIVAMARGIN_CONFIG.get(`auto_liquidate:${broker}|${fund}`);
+        flagMap[pair] = value === 'true';
+      }
+      return flagMap;
     });
 
     // Step 6: Create margin calls for breaches
@@ -409,6 +424,57 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
               'MarkMarginCalled',
               {}
             );
+
+            // Auto-liquidate if enabled for this broker-fund pair (from KV)
+            if (autoLiqFlags[pairKey]) {
+              const vault = vaults[result.vaultId];
+              let liquidatedAmount = requiredAmount;
+
+              if (vault && env.DEPLOYER_PRIVATE_KEY && env.CANTON_AUTH_SECRET) {
+                try {
+                  const liqResult = await executeLiquidation({
+                    env,
+                    position: {
+                      contractId: result.contractId,
+                      positionId: result.positionId,
+                      vaultId: result.vaultId,
+                      fund: result.fund,
+                      broker: result.broker,
+                      notional: result.notional,
+                      collateralValue: result.collateralValue,
+                      pnl: result.pnl,
+                      currentLTV: result.currentLTV,
+                    },
+                    vault,
+                    prices,
+                    threshold,
+                  });
+
+                  if (liqResult.totalSeizedUSD > 0) {
+                    liquidatedAmount = liqResult.totalSeizedUSD;
+                  }
+
+                  console.log(`[Auto-Liquidation] Position ${result.positionId}: seized $${liqResult.totalSeizedUSD.toFixed(2)}, ` +
+                    `escrow: ${liqResult.escrowSeizures.length}, canton: ${liqResult.cantonSeizures.length}, errors: ${liqResult.errors.length}`);
+
+                  if (liqResult.errors.length > 0) {
+                    console.warn(`[Auto-Liquidation] Errors for ${result.positionId}:`, liqResult.errors.join('; '));
+                  }
+                } catch (err) {
+                  console.error(`[Auto-Liquidation] Seizure failed for ${result.positionId}, proceeding with LiquidatePosition:`, err);
+                }
+              } else {
+                console.log(`[Auto-Liquidation] Skipping seizure for ${result.positionId}: missing DEPLOYER_PRIVATE_KEY or CANTON_AUTH_SECRET`);
+              }
+
+              // Always exercise LiquidatePosition on Canton (even if seizure partially failed)
+              await cantonExercise(env, result.contractId, POSITION_TEMPLATE, 'LiquidatePosition', {
+                ltvThreshold: threshold.toString(),
+                liquidatedAmount: liquidatedAmount.toString(),
+                liquidatedAt: new Date().toISOString(),
+              });
+              console.log(`Auto-liquidated position ${result.positionId}: LTV ${(result.currentLTV * 100).toFixed(1)}% >= ${(threshold * 100).toFixed(0)}%, amount: $${liquidatedAmount.toFixed(2)}`);
+            }
 
             console.log(`Created margin call for ${result.positionId}: LTV ${(result.currentLTV * 100).toFixed(1)}% >= ${(threshold * 100).toFixed(0)}%`);
           });
@@ -448,6 +514,56 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
       marginCallsCreated,
       timestamp: new Date().toISOString(),
     };
+
+    // Step 8: Persist run record to KV for operator dashboard visibility
+    await step.do('persist-run-record', async () => {
+      const runRecord = {
+        timestamp: summary.timestamp,
+        processed: summary.processed,
+        marginCallsCreated: summary.marginCallsCreated,
+        positions: ltvResults.map(r => {
+          const pairKey = `${r.broker}|${r.fund}`;
+          const threshold = thresholds[pairKey] || 0.8;
+          return {
+            positionId: r.positionId,
+            vaultId: r.vaultId,
+            fund: r.fund,
+            broker: r.broker,
+            notional: r.notional,
+            collateralValue: r.collateralValue,
+            pnl: r.pnl,
+            currentLTV: r.currentLTV,
+            breached: r.currentLTV >= threshold,
+            autoLiquidated: r.currentLTV >= threshold && (autoLiqFlags[pairKey] || false),
+          };
+        }),
+        prices: {
+          CC: prices['CC'] || 0,
+          ETH: prices['ETH'] || 0,
+          BTC: prices['BTC'] || 0,
+          USDC: prices['USDC'] || 0,
+          SOL: prices['SOL'] || 0,
+        },
+      };
+
+      // Write the individual run record (30-day TTL)
+      await env.PRIVAMARGIN_CONFIG.put(
+        `workflow:run:${summary.timestamp}`,
+        JSON.stringify(runRecord),
+        { expirationTtl: 30 * 24 * 60 * 60 }
+      );
+
+      // Maintain rolling index of last 100 timestamps
+      const indexRaw = await env.PRIVAMARGIN_CONFIG.get('workflow:runs:index');
+      const index: string[] = indexRaw ? JSON.parse(indexRaw) : [];
+      index.push(summary.timestamp);
+      if (index.length > 100) {
+        index.splice(0, index.length - 100);
+      }
+      await env.PRIVAMARGIN_CONFIG.put('workflow:runs:index', JSON.stringify(index));
+
+      console.log(`Persisted run record: ${summary.timestamp}`);
+    });
 
     console.log(`LTV Monitor complete: ${summary.processed} positions processed, ${summary.marginCallsCreated} margin calls created`);
     return summary;
