@@ -6,7 +6,7 @@ import {
 } from '@mui/material';
 import {
   Add, Visibility, VisibilityOff, Lock, LockOpen, TrendingUp, Warning, Shield,
-  Schedule, ExpandMore, ExpandLess, CheckCircle, Warning as WarningIcon,
+  Schedule, ExpandMore, ExpandLess, CheckCircle,
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 import { vaultAPI, marginAPI, invitationAPI, positionAPI, linkAPI, workflowMarginCallAPI, getCustodianParty } from '../services/api';
@@ -1085,7 +1085,7 @@ function WorkflowLogPanel() {
                                       {pos.autoLiquidated ? (
                                         <Chip label="Liquidated" size="small" sx={{ bgcolor: 'rgba(239,68,68,0.15)', color: '#ef4444', fontSize: 10, height: 20 }} />
                                       ) : pos.breached ? (
-                                        <Chip label="Breached" size="small" icon={<WarningIcon sx={{ fontSize: '12px !important', color: '#f59e0b !important' }} />} sx={{ bgcolor: 'rgba(245,158,11,0.15)', color: '#f59e0b', fontSize: 10, height: 20 }} />
+                                        <Chip label="Breached" size="small" icon={<Warning sx={{ fontSize: '12px !important', color: '#f59e0b !important' }} />} sx={{ bgcolor: 'rgba(245,158,11,0.15)', color: '#f59e0b', fontSize: 10, height: 20 }} />
                                       ) : (
                                         <Chip label="OK" size="small" icon={<CheckCircle sx={{ fontSize: '12px !important', color: '#00d4aa !important' }} />} sx={{ bgcolor: 'rgba(0,212,170,0.1)', color: '#00d4aa', fontSize: 10, height: 20 }} />
                                       )}
