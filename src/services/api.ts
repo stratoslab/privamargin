@@ -2901,6 +2901,9 @@ export const positionAPI = {
     let brokerCantonParty = pos.broker || '';
     const liquidatedAt = new Date().toISOString();
     const escrowTxHashes: string[] = [];
+    const seizureDebug: string[] = [];  // Track seizure steps for debugging
+
+    seizureDebug.push(`pnl=${pnl.toFixed(2)}, collateral=${liveCollateralValue.toFixed(2)}, seizureAmt=${liquidationAmountUSD.toFixed(2)}, vaults=${vaults.length}`);
 
     // Only perform seizure if there is an amount owed AND vault exists
     if (liquidationAmountUSD > 0 && vaults.length > 0) {
@@ -3027,6 +3030,7 @@ export const positionAPI = {
 
       // Sort by priority: USDC_CANTON/USDC (0) → CUSDC (1) → CC (2) → ETH (3)
       inventory.sort((a, b) => a.priority - b.priority);
+      seizureDebug.push(`inventory: ${inventory.map(i => `${i.type}=$${i.valueUSD.toFixed(2)}`).join(', ') || 'EMPTY'}`);
 
       // ── Phase 2: Plan ───────────────────────────────────────────────
       // Walk inventory and compute how much of each asset to seize.
@@ -3220,6 +3224,8 @@ export const positionAPI = {
         }
       }
 
+      seizureDebug.push(`seizedVaultAssets: ${seizedVaultAssets.map(s => `${s.assetId}=${s.amount}`).join(', ') || 'EMPTY'}`);
+
       if (seizedVaultAssets.length > 0) {
         // Exercise SeizeCollateral via server-side endpoint (the vault's operator
         // is the custodian party, which the wallet SDK can't actAs).
@@ -3248,12 +3254,12 @@ export const positionAPI = {
                 vaultCid = seizeData.newContractId;
               }
               if (seizeData.success) {
-                console.log(`[Liquidation] SeizeCollateral: ${seized.assetId} ${seized.amount} ($${seized.valueUSD.toFixed(2)})`);
+                seizureDebug.push(`SEIZED: ${seized.assetId} ${seized.amount} ($${seized.valueUSD.toFixed(2)})`);
               } else {
-                console.warn(`[Liquidation] SeizeCollateral failed for ${seized.assetId}: ${seizeData.error}`);
+                seizureDebug.push(`SEIZE_FAIL: ${seized.assetId} → ${seizeData.error || seizeRes.status}`);
               }
             } catch (err) {
-              console.warn(`[Liquidation] SeizeCollateral failed for ${seized.assetId}:`, err);
+              seizureDebug.push(`SEIZE_ERROR: ${seized.assetId} → ${err instanceof Error ? err.message : String(err)}`);
             }
           }
         }
@@ -3323,6 +3329,7 @@ export const positionAPI = {
         success: true,
         liquidatedAmount: liquidationAmountUSD,
         escrowTxHash,
+        seizureDebug,
       },
     };
   },

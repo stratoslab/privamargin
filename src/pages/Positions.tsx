@@ -1165,6 +1165,7 @@ function BrokerPositions({ user }: { user: AuthUser }) {
   const [openLiquidateConfirm, setOpenLiquidateConfirm] = useState(false);
   const [selectedPosition, setSelectedPosition] = useState<PositionData | null>(null);
   const [liquidateError, setLiquidateError] = useState('');
+  const [seizureResult, setSeizureResult] = useState<string[] | null>(null);
   const [detailPosition, setDetailPosition] = useState<PositionData | null>(null);
 
   const partyId = user.partyId || user.id;
@@ -1201,10 +1202,17 @@ function BrokerPositions({ user }: { user: AuthUser }) {
     if (!selectedPosition) return;
     setLiquidating(selectedPosition.positionId);
     setLiquidateError('');
+    setSeizureResult(null);
     try {
-      await positionAPI.liquidate(selectedPosition.positionId);
-      setOpenLiquidateConfirm(false);
-      setSelectedPosition(null);
+      const result = await positionAPI.liquidate(selectedPosition.positionId);
+      const debug = (result as { data?: { seizureDebug?: string[] } })?.data?.seizureDebug;
+      if (debug && debug.length > 0) {
+        setSeizureResult(debug);
+        // Keep dialog open so user can see seizure details
+      } else {
+        setOpenLiquidateConfirm(false);
+        setSelectedPosition(null);
+      }
       await loadData();
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Liquidation failed';
@@ -1448,18 +1456,29 @@ function BrokerPositions({ user }: { user: AuthUser }) {
                     <Typography sx={{ fontSize: 12, color: '#ef4444' }}>{liquidateError}</Typography>
                   </Box>
                 )}
+
+                {seizureResult && (
+                  <Box sx={{ mt: 2, p: 1.5, bgcolor: 'rgba(0,212,170,0.08)', borderRadius: '8px', border: '1px solid rgba(0,212,170,0.3)' }}>
+                    <Typography sx={{ fontSize: 12, fontWeight: 600, color: '#00d4aa', mb: 0.5 }}>Seizure Debug</Typography>
+                    {seizureResult.map((line, i) => (
+                      <Typography key={i} sx={{ fontSize: 11, color: line.startsWith('SEIZE_FAIL') || line.startsWith('SEIZE_ERROR') ? '#ef4444' : 'rgba(255,255,255,0.6)', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                        {line}
+                      </Typography>
+                    ))}
+                  </Box>
+                )}
               </Box>
             );
           })()}
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
           <Button
-            onClick={() => { setOpenLiquidateConfirm(false); setSelectedPosition(null); setLiquidateError(''); }}
+            onClick={() => { setOpenLiquidateConfirm(false); setSelectedPosition(null); setLiquidateError(''); setSeizureResult(null); }}
             sx={{ color: 'rgba(255,255,255,0.5)' }}
           >
             Cancel
           </Button>
-          <Button
+          {!seizureResult && <Button
             variant="contained"
             onClick={handleLiquidateConfirm}
             disabled={!!liquidating}
@@ -1472,7 +1491,7 @@ function BrokerPositions({ user }: { user: AuthUser }) {
             }}
           >
             {liquidating ? 'Liquidating...' : 'Confirm Liquidation'}
-          </Button>
+          </Button>}
         </DialogActions>
       </Dialog>
 
