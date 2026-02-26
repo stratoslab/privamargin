@@ -2863,14 +2863,25 @@ export const positionAPI = {
       liveCollateralValue = vaultLive.totalValue;
     }
 
-    // 6. Calculate liquidation amount based on PnL
+    // 6. Calculate liquidation amount based on LIVE PnL (not stale on-ledger value)
+    //    The on-ledger unrealizedPnL may be 0 if the workflow hasn't updated it yet.
+    //    Compute fresh PnL from current market price, same as the position listing does.
     //    - Negative PnL = fund lost money → broker seizes |PnL| from collateral
     //    - Positive PnL = fund is winning → no collateral seizure (just close position)
     //    - Cap at vault's live collateral value (can't seize more than what's in the vault)
-    const pnl = pos.unrealizedPnL || 0;
+    const livePrices = await fetchLivePrices();
+    const assetSymbol = pos.description.trim().split(/\s+/).pop() || '';
+    const liveAssetPrice = livePrices[assetSymbol] || 0;
+    let pnl = pos.unrealizedPnL || 0;
+    if (pos.entryPrice && pos.units && liveAssetPrice) {
+      pnl = pos.direction === 'Short'
+        ? pos.units * (pos.entryPrice - liveAssetPrice)
+        : pos.units * (liveAssetPrice - pos.entryPrice);
+    }
     const liquidationAmountUSD = pnl < 0
       ? Math.min(Math.abs(pnl), liveCollateralValue)
       : 0;
+    console.log(`[Liquidation] Position ${positionId}: live PnL=$${pnl.toFixed(2)}, collateral=$${liveCollateralValue.toFixed(2)}, seizure=$${liquidationAmountUSD.toFixed(2)}`);
 
     // Prepare liquidation record tracking
     const escrowLiquidations: LiquidationRecord['escrowLiquidations'] = [];
