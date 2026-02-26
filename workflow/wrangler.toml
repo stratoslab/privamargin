@@ -10,13 +10,32 @@ binding = "LTV_MONITOR_WORKFLOW"
 class_name = "LTVMonitorWorkflow"
 
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["* * * * *"]
+
+[[kv_namespaces]]
+binding = "PRIVAMARGIN_CONFIG"
+id = "7c64523d0f71497183bd9a20295df71a"
 
 [vars]
 CANTON_HOST = "p2-json.cantondefi.com"
-PACKAGE_ID = "853e61bc849b9ebdbc3c1e9d7bab2f2e96681e276e68ba32c33019bf61d5d1f9"
+PACKAGE_ID = "5240415c3ba99ccac4f73d5c8243d909cd08b8ec2bdf7c87c54645ad99595fb6"
 COINMARKETCAP_API_KEY = "441479ed834c4782a04e48d0cb2c2160"
+
+# EVM RPC endpoints
+RPC_SEPOLIA = "https://ethereum-sepolia-rpc.publicnode.com"
+RPC_BASE_SEPOLIA = "https://base-sepolia-rpc.publicnode.com"
+RPC_ETHEREUM = "https://ethereum-rpc.publicnode.com"
+RPC_BASE = "https://base-rpc.publicnode.com"
+NETWORK_MODE = "testnet"
+
+# Splice/Canton custodian config
+SPLICE_HOST = "p1.cantondefi.com"
+SPLICE_PORT = "443"
+CANTON_AUTH_AUDIENCE = "https://canton.network.global"
+CUSTODIAN_USER = "vault-custodian"
 
 # Secrets (set via `wrangler secret put`):
 # - CANTON_AUTH_TOKEN
 # - OPERATOR_PARTY
+# - DEPLOYER_PRIVATE_KEY
+# - CANTON_AUTH_SECRET

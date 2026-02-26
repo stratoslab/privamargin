@@ -44,7 +44,7 @@ PrivaMargin enables hedge funds to prove margin sufficiency to prime brokers usi
 │  /api/auto-liquidate                                      │
 ├──────────────────────────────────────────────────────────┤
 │              Cloudflare Workflow Worker                    │
-│  LTV Monitor (cron: every 15 min)                         │
+│  LTV Monitor (cron: every min, KV-gated interval)         │
 │  Reads: Canton positions/vaults/links + KV auto-liq prefs │
 │  Writes: margin calls, position updates, auto-liquidation │
 ├─────────────────────────┬───────────────────────────────┤
@@ -80,7 +80,7 @@ Roles are recorded as `RoleAssignment` contracts on Canton. The operator creates
 
 ## Daml Smart Contracts
 
-All contracts are defined in `daml/src/` and compiled to a DAR package (`daml/.daml/dist/privamargin3-0.6.0.dar`). SDK version: 3.4.9, target: Canton 2.1.
+All contracts are defined in `daml/src/` and compiled to a DAR package (`daml/.daml/dist/privamargin6-0.1.0.dar`). SDK version: 3.4.9, target: Canton 2.1.
 
 ### `Roles.daml` — Role Management
 
@@ -165,14 +165,20 @@ Position (signatory: fund; observer: broker, operator)
     notionalValue, collateralValue, currentLTV,
     status: Open | MarginCalled | Liquidated | Closed,
     direction: Optional (Long | Short),
-    entryPrice, units, unrealizedPnL, createdAt, lastChecked
+    entryPrice, units, unrealizedPnL, closingPrice,
+    zkCollateralProofHash: Optional Text,
+    zkProofTimestamp: Optional Text,
+    createdAt, lastChecked
 
   Choices:
-    ├── UpdateLTV(newCollateralValue, newLTV, checkedAt, newPnL)  [controller: operator]
-    ├── MarkMarginCalled()                                        [controller: operator]
-    ├── ClosePosition()                                           [controller: fund]
-    └── LiquidatePosition(ltvThreshold, liquidatedAmount, liquidatedAt)  [controller: operator]
+    ├── UpdateLTV(newLTV, checkedAt, newPnL)                       [controller: operator]
+    ├── MarkMarginCalled()                                          [controller: operator]
+    ├── AttestCollateral(proofHash, attestedAt)                     [controller: fund]
+    ├── ClosePosition(finalPnL, exitPrice)                          [controller: fund]
+    └── LiquidatePosition(ltvThreshold, liquidatedAmount, ...)      [controller: operator]
 ```
+
+`AttestCollateral` allows the fund to record a ZK proof hash and timestamp on-ledger, attesting to collateral sufficiency. The proof itself is stored off-ledger in KV; only the hash is on-chain. `UpdateLTV` (operator) preserves ZK fields via Daml's `this with` semantics — operator LTV updates never overwrite the fund's attestation.
 
 `LiquidatePosition` enforces two assertions:
 1. `currentLTV >= ltvThreshold` — position must actually be underwater
@@ -314,6 +320,25 @@ Artifacts are served as static files from `public/zk/`:
 - `ltv_verifier.wasm` — WASM witness generator
 - `ltv_verifier_final.zkey` — Groth16 proving key
 - `verification_key.json` — Groth16 verification key
+
+### Live LTV ZK Integration
+
+ZK proofs are automatically generated as part of the normal position flow — not just on the standalone Margin Verification page:
+
+1. **Fund loads positions** → `recalcPositionsLive()` runs in `api.ts`
+2. After LTV recalc, the fund generates one Groth16 proof per vault (attesting raw collateral sufficiency)
+3. Proof is stored to KV via `POST /api/zkproof` (fire-and-forget) and hash is written on-ledger via `AttestCollateral`
+4. Proofs are rate-limited to one per vault every 5 minutes (skips if existing proof is recent)
+5. **Broker opens position detail** → sees ZK Attestation section → clicks "Verify Proof" → fetches full proof from KV → runs `verifyLTVProof()` in-browser
+
+The ZK proof attests to raw collateral sufficiency (no PnL). PnL is public data derived from market prices and on-ledger fields.
+
+| Component | Role | What happens |
+|-----------|------|--------------|
+| `api.ts` `recalcPositionsLive` | Fund | Generates proof, stores to KV, exercises `AttestCollateral` on-ledger |
+| `functions/api/zkproof.ts` | Both | KV-backed storage: `POST` stores proof, `GET ?hash=` retrieves it |
+| `Positions.tsx` detail dialog | Broker | Fetches proof from KV, verifies in-browser, shows Verified/Invalid chip |
+| `Position.daml` `AttestCollateral` | Fund | Records `zkCollateralProofHash` + `zkProofTimestamp` on-ledger |
 
 ---
 
@@ -614,13 +639,14 @@ LTV is recalculated on every query using live prices from CoinGecko (60-second c
 
 ### ZK-Verified Margin
 
-When ZK artifacts are available, margin verification generates a real Groth16 proof:
+ZK proofs are generated automatically during the fund's normal position flow (not just on the standalone Margin page):
 
 1. Fund's asset values (private inputs) are converted to cents and padded to 10 slots
 2. Proof is generated in-browser via snarkjs WASM (typically completes in seconds)
 3. Public signals reveal only: computed LTV (basis points), liquidatability flag, notional value, threshold
-4. Broker verifies the proof using only the verification key — **never sees individual asset values**
-5. Proof hash (SHA-256) is displayed in the dashboard for auditability
+4. Proof hash is written on-ledger via `AttestCollateral`; full proof stored in KV (`/api/zkproof`)
+5. Broker verifies the proof using only the verification key — **never sees individual asset values**
+6. Broker's position detail dialog shows a "Verify Proof" button that fetches and verifies in-browser
 
 ### What Each Party Sees
 
@@ -637,7 +663,7 @@ When ZK artifacts are available, margin verification generates a real Groth16 pr
 
 ## LTV Monitor Workflow
 
-A Cloudflare Workflow Worker (`workflow/ltv-monitor.ts`) runs on a 15-minute cron schedule to automatically monitor all open positions and take action when LTV thresholds are breached.
+A Cloudflare Workflow Worker (`workflow/ltv-monitor.ts`) runs on a per-minute cron schedule with a KV-configurable check interval (default 15 minutes) to automatically monitor all open positions and take action when LTV thresholds are breached. The operator can change the check frequency from the dashboard UI without redeploying.
 
 ### Workflow Steps
 
@@ -704,7 +730,8 @@ LTV >= threshold?
 
 | Setting | Location | Description |
 |---------|----------|-------------|
-| Cron schedule | `workflow/wrangler.toml` | `*/15 * * * *` (every 15 minutes) |
+| Cron schedule | `workflow/wrangler.toml` | `* * * * *` (every minute, KV-gated) |
+| Check interval | KV `workflow:check_interval` | Configurable: 1, 5, 15, 30, or 60 minutes (default 15). Set via `/api/workflow/config` or dashboard UI |
 | Canton host | `workflow/wrangler.toml` vars | `CANTON_HOST` — Canton JSON API endpoint |
 | Package ID | `workflow/wrangler.toml` vars | `PACKAGE_ID` — Daml DAR package hash |
 | CMC API key | `workflow/wrangler.toml` vars | `COINMARKETCAP_API_KEY` — for live prices |
@@ -843,7 +870,9 @@ Serverless API endpoints deployed alongside the frontend. Use Cloudflare KV (`PR
 | `/api/custodian/accept-deposit` | POST | Accept CC transfer offers on custodian's behalf via Splice API |
 | `/api/custodian/withdraw` | POST | Create CC transfer from custodian to user via Splice API |
 | `/api/auto-liquidate` | GET/POST | Broker auto-liquidate preferences per fund (KV-backed) |
+| `/api/zkproof` | GET/POST | ZK proof storage — POST stores proof JSON under `zkproof:{hash}` with 30-day TTL, GET `?hash=` retrieves full proof |
 | `/api/workflow/history` | GET | Workflow run history — list recent runs or fetch single run by timestamp |
+| `/api/workflow/config` | GET/POST | Workflow check frequency — GET returns `{ checkInterval }`, POST accepts `{ checkInterval: 1|5|15|30|60 }` |
 | `/api/admin/provision-custodian` | GET/POST | Provision dedicated vault-custodian Canton party |
 
 ### Escrow Deployment Details
@@ -862,7 +891,7 @@ Serverless API endpoints deployed alongside the frontend. Use Cloudflare KV (`PR
 |------|-------|-------|-------------|
 | **Dashboard** | `/` | All | Role-specific overview with stats, ZK proof status, margin call alerts |
 | **Vaults** | `/vaults` | Fund | Create vaults, deposit/withdraw assets, deploy escrows, sync balances |
-| **Positions** | `/positions` | Fund, Broker | Open/close/liquidate positions, detail dialog with liquidation breakdown |
+| **Positions** | `/positions` | Fund, Broker | Open/close/liquidate positions, detail dialog with liquidation breakdown, ZK attestation verification |
 | **My Brokers** | `/brokers` | Fund | View broker links, respond to invitations and LTV proposals |
 | **Client Accounts** | `/funds` | Broker | Manage fund links, set thresholds and allowed assets |
 | **Margin** | `/margin` | Fund, Broker | Margin verification with ZK proof generation |
@@ -1015,9 +1044,11 @@ stratos-privamargin/
 │       └── Roles.daml         # Operator, broker, fund roles
 ├── functions/api/             # Cloudflare Pages Functions
 │   ├── config.ts              # Platform configuration
+│   ├── zkproof.ts             # ZK proof KV storage (POST store, GET retrieve)
 │   ├── auto-liquidate.ts      # Broker auto-liquidate prefs (KV)
 │   ├── workflow/
-│   │   └── history.ts         # Workflow run history (KV-backed)
+│   │   ├── history.ts         # Workflow run history (KV-backed)
+│   │   └── config.ts          # Workflow check frequency config (KV-backed)
 │   ├── prices.ts              # Live asset prices
 │   ├── roles.ts               # Role assignment
 │   ├── positions.ts           # Position CRUD (KV fallback)

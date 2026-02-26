@@ -24,6 +24,9 @@ template Position
     entryPrice: Optional Decimal
     units: Optional Decimal
     unrealizedPnL: Optional Decimal
+    closingPrice: Optional Decimal
+    zkCollateralProofHash: Optional Text
+    zkProofTimestamp: Optional Text
   where
     signatory fund
     observer broker, operator
@@ -45,16 +48,34 @@ template Position
       do
         create this with status = MarginCalled
 
-    choice ClosePosition: ContractId Position
+    choice AttestCollateral: ContractId Position
+      with
+        proofHash: Text
+        attestedAt: Text
       controller fund
       do
-        create this with status = Closed
+        create this with
+          zkCollateralProofHash = Some proofHash
+          zkProofTimestamp = Some attestedAt
+
+    choice ClosePosition: ContractId Position
+      with
+        finalPnL: Optional Decimal
+        exitPrice: Optional Decimal
+      controller fund
+      do
+        create this with
+          status = Closed
+          unrealizedPnL = finalPnL
+          closingPrice = exitPrice
 
     choice LiquidatePosition: ContractId Position
       with
         ltvThreshold: Decimal
         liquidatedAmount: Decimal
         liquidatedAt: Text
+        finalPnL: Optional Decimal
+        exitPrice: Optional Decimal
       controller operator
       do
         assertMsg "LTV below threshold, cannot liquidate"
@@ -64,3 +85,5 @@ template Position
         create this with
           status = Liquidated
           lastChecked = liquidatedAt
+          unrealizedPnL = finalPnL
+          closingPrice = exitPrice

@@ -5,11 +5,13 @@ import {
   Stepper, Step, StepLabel,
   Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
 } from '@mui/material';
-import { Add, TrendingUp, Close, ArrowBack, ArrowForward, Warning, Gavel } from '@mui/icons-material';
-import { positionAPI, linkAPI, vaultAPI, getLivePrice, displaySymbol } from '../services/api';
+import { Add, TrendingUp, Close, ArrowBack, ArrowForward, Warning, Gavel, Shield } from '@mui/icons-material';
+import { positionAPI, linkAPI, vaultAPI, getLivePrice, displaySymbol, getAssetPriceHistory, fetchZKProof } from '../services/api';
+import TokenIcon from '../components/TokenIcon';
 import type { PositionData, BrokerFundLinkData, LiquidationRecord } from '../services/api';
 import { useRole } from '../context/RoleContext';
 import type { AuthUser, Asset } from '@stratos-wallet/sdk';
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, ReferenceLine, CartesianGrid } from 'recharts';
 
 interface PositionsProps {
   user: AuthUser;
@@ -74,6 +76,77 @@ const detailRow = (label: string, value: string, color?: string) => (
   </Box>
 );
 
+function ZKAttestationSection({ proofHash, proofTimestamp }: { proofHash: string; proofTimestamp?: string }) {
+  const [verifyState, setVerifyState] = useState<'idle' | 'loading' | 'verified' | 'invalid'>('idle');
+
+  const handleVerify = async () => {
+    setVerifyState('loading');
+    try {
+      const proofData = await fetchZKProof(proofHash);
+      if (!proofData) {
+        setVerifyState('invalid');
+        return;
+      }
+      const { verifyLTVProof } = await import('../services/zkProof');
+      const data = proofData as { proof: unknown; publicSignals: string[] };
+      const ok = await verifyLTVProof(data.proof as Parameters<typeof verifyLTVProof>[0], data.publicSignals);
+      setVerifyState(ok ? 'verified' : 'invalid');
+    } catch {
+      setVerifyState('invalid');
+    }
+  };
+
+  const truncatedHash = `${proofHash.slice(0, 10)}...${proofHash.slice(-8)}`;
+
+  return (
+    <Box sx={{ bgcolor: 'rgba(139,92,246,0.06)', borderRadius: '8px', p: 2, mb: 2, border: '1px solid rgba(139,92,246,0.2)' }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5 }}>
+        <Shield sx={{ color: '#8b5cf6', fontSize: 20 }} />
+        <Typography sx={{ fontSize: 14, fontWeight: 600, color: '#8b5cf6' }}>ZK Collateral Attestation</Typography>
+      </Box>
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.5 }}>
+        <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>Proof Hash</Typography>
+        <Typography sx={{ fontSize: 12, fontFamily: 'monospace', color: 'rgba(255,255,255,0.7)' }}>{truncatedHash}</Typography>
+      </Box>
+      {proofTimestamp && (
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.5 }}>
+          <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>Attested At</Typography>
+          <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.7)' }}>{new Date(proofTimestamp).toLocaleString()}</Typography>
+        </Box>
+      )}
+      <Box sx={{ mt: 1.5, display: 'flex', alignItems: 'center', gap: 1 }}>
+        {verifyState === 'idle' && (
+          <Button
+            size="small"
+            startIcon={<Shield />}
+            onClick={handleVerify}
+            sx={{
+              color: '#8b5cf6',
+              bgcolor: 'rgba(139,92,246,0.12)',
+              textTransform: 'none',
+              fontSize: 12,
+              fontWeight: 600,
+              px: 1.5,
+              '&:hover': { bgcolor: 'rgba(139,92,246,0.2)' },
+            }}
+          >
+            Verify Proof
+          </Button>
+        )}
+        {verifyState === 'loading' && (
+          <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>Verifying...</Typography>
+        )}
+        {verifyState === 'verified' && (
+          <Chip label="Verified" size="small" sx={{ bgcolor: 'rgba(0,212,170,0.2)', color: '#00d4aa', fontWeight: 600, fontSize: 11 }} />
+        )}
+        {verifyState === 'invalid' && (
+          <Chip label="Invalid" size="small" sx={{ bgcolor: 'rgba(239,68,68,0.2)', color: '#ef4444', fontWeight: 600, fontSize: 11 }} />
+        )}
+      </Box>
+    </Box>
+  );
+}
+
 function PositionDetailDialog({
   position,
   ltvThreshold,
@@ -84,6 +157,11 @@ function PositionDetailDialog({
   onClose: () => void;
 }) {
   const [liqRecord, setLiqRecord] = useState<LiquidationRecord | null>(null);
+  const [priceHistory, setPriceHistory] = useState<Array<{ time: number; price: number }>>([]);
+  const [chartDays, setChartDays] = useState(7);
+
+  // Parse asset symbol from description (e.g. "LONG 2 BTC" → "BTC")
+  const assetSymbol = position?.description?.split(' ').pop() || '';
 
   useEffect(() => {
     if (position?.status === 'Liquidated') {
@@ -94,6 +172,18 @@ function PositionDetailDialog({
     }
   }, [position]);
 
+  useEffect(() => {
+    if (!position || !assetSymbol) {
+      setPriceHistory([]);
+      return;
+    }
+    let cancelled = false;
+    getAssetPriceHistory(assetSymbol, chartDays).then((data) => {
+      if (!cancelled) setPriceHistory(data);
+    });
+    return () => { cancelled = true; };
+  }, [position, assetSymbol, chartDays]);
+
   if (!position) return null;
 
   const ltvColor = getLTVColor(position.currentLTV, ltvThreshold);
@@ -103,13 +193,19 @@ function PositionDetailDialog({
     <Dialog
       open={!!position}
       onClose={onClose}
-      maxWidth="sm"
+      maxWidth="md"
       fullWidth
       PaperProps={{ sx: { bgcolor: '#111820', color: 'white', maxHeight: '85vh' } }}
     >
       <DialogTitle sx={{ pb: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
           <Typography sx={{ fontSize: 18, fontWeight: 600 }}>{position.positionId}</Typography>
+          {assetSymbol && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, bgcolor: 'rgba(245,158,11,0.15)', borderRadius: '12px', px: 1, py: 0.25 }}>
+              <TokenIcon symbol={assetSymbol} size={16} />
+              <Typography sx={{ color: '#f59e0b', fontWeight: 700, fontSize: 11 }}>{assetSymbol}</Typography>
+            </Box>
+          )}
           <Chip
             label={position.direction || 'Long'}
             size="small"
@@ -138,12 +234,105 @@ function PositionDetailDialog({
           {detailRow('Last Checked', new Date(position.lastChecked).toLocaleString())}
         </Box>
 
+        {/* Price chart */}
+        {priceHistory.length > 0 && (
+          <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2, mb: 2 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1.5 }}>
+              <Typography sx={{ fontSize: 14, fontWeight: 600, color: 'white' }}>
+                {assetSymbol} Price
+              </Typography>
+              <Box sx={{ display: 'flex', gap: 0.5 }}>
+                {([1, 7, 30] as const).map((d) => (
+                  <Button
+                    key={d}
+                    size="small"
+                    onClick={() => setChartDays(d)}
+                    sx={{
+                      minWidth: 36,
+                      height: 24,
+                      fontSize: 11,
+                      fontWeight: 600,
+                      textTransform: 'none',
+                      color: chartDays === d ? '#f59e0b' : 'rgba(255,255,255,0.4)',
+                      bgcolor: chartDays === d ? 'rgba(245,158,11,0.15)' : 'transparent',
+                      borderRadius: '6px',
+                      '&:hover': { bgcolor: chartDays === d ? 'rgba(245,158,11,0.2)' : 'rgba(255,255,255,0.05)' },
+                    }}
+                  >
+                    {d}d
+                  </Button>
+                ))}
+              </Box>
+            </Box>
+            <ResponsiveContainer width="100%" height={200}>
+              <AreaChart data={priceHistory}>
+                <defs>
+                  <linearGradient id="priceGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#f59e0b" stopOpacity={0.3} />
+                    <stop offset="100%" stopColor="#f59e0b" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                <XAxis
+                  dataKey="time"
+                  tickFormatter={(t: number) => {
+                    const d = new Date(t);
+                    return chartDays <= 1
+                      ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                      : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+                  }}
+                  tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.4)' }}
+                  axisLine={{ stroke: 'rgba(255,255,255,0.1)' }}
+                  tickLine={false}
+                />
+                <YAxis
+                  domain={['auto', 'auto']}
+                  tickFormatter={(v: number) => `$${v.toLocaleString()}`}
+                  tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.4)' }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={70}
+                />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: '#1a2332',
+                    border: '1px solid rgba(255,255,255,0.1)',
+                    borderRadius: '8px',
+                    fontSize: 12,
+                    color: 'white',
+                  }}
+                  labelFormatter={(t: number) => new Date(t).toLocaleString()}
+                  formatter={(value: number) => [`$${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, 'Price']}
+                />
+                {position.entryPrice > 0 && (
+                  <ReferenceLine
+                    y={position.entryPrice}
+                    stroke="#60a5fa"
+                    strokeDasharray="4 4"
+                    label={{ value: 'Entry', fill: '#60a5fa', fontSize: 10, position: 'right' }}
+                  />
+                )}
+                <Area
+                  type="monotone"
+                  dataKey="price"
+                  stroke="#f59e0b"
+                  strokeWidth={2}
+                  fill="url(#priceGradient)"
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </Box>
+        )}
+
         {/* Open / MarginCalled — active position details */}
         {(position.status === 'Open' || position.status === 'MarginCalled') && (
           <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2, mb: 2 }}>
             <Typography sx={{ fontSize: 14, fontWeight: 600, color: 'white', mb: 1 }}>Position Details</Typography>
             {detailRow('Notional Value', `$${position.notionalValue.toLocaleString()}`)}
-            {detailRow('Collateral Value', `$${position.collateralValue.toLocaleString()}`)}
+            {detailRow('Collateral Value',
+              position.collateralValue ? `$${position.collateralValue.toLocaleString()}` : 'Encrypted',
+              position.collateralValue ? undefined : 'rgba(255,255,255,0.25)',
+            )}
             {detailRow('Entry Price', position.entryPrice ? `$${position.entryPrice.toLocaleString()}` : '-')}
             {detailRow('Units', position.units ? position.units.toLocaleString() : '-')}
             {detailRow('Unrealized PnL',
@@ -181,13 +370,18 @@ function PositionDetailDialog({
               <Typography sx={{ fontSize: 14, fontWeight: 600, color: '#ef4444', mb: 1 }}>
                 Liquidation Summary
               </Typography>
+              {/* Price & PnL details — always shown from on-ledger data */}
+              {detailRow('Notional Value', `$${position.notionalValue.toLocaleString()}`)}
+              {detailRow('Units', position.units ? position.units.toLocaleString() : '-')}
+              {detailRow('Entry Price', position.entryPrice ? `$${position.entryPrice.toLocaleString()}` : '-')}
+              {detailRow('Closing Price', position.closingPrice ? `$${position.closingPrice.toLocaleString()}` : '-')}
+              {detailRow('PnL at Liquidation',
+                `${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+                pnl >= 0 ? '#00d4aa' : '#ef4444',
+              )}
               {liqRecord ? (
                 <>
                   {detailRow('Liquidated At', new Date(liqRecord.liquidatedAt).toLocaleString())}
-                  {detailRow('PnL at Liquidation',
-                    `${liqRecord.pnl >= 0 ? '+' : ''}$${liqRecord.pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
-                    liqRecord.pnl >= 0 ? '#00d4aa' : '#ef4444',
-                  )}
                   {detailRow('Amount Owed', `$${liqRecord.liquidationAmountUSD.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, '#ef4444')}
                   {detailRow('Collateral at Liquidation', `$${liqRecord.collateralValueAtLiquidation.toLocaleString()}`)}
                   {detailRow('LTV at Liquidation', `${(liqRecord.ltvAtLiquidation * 100).toFixed(1)}%`, '#ef4444')}
@@ -195,14 +389,12 @@ function PositionDetailDialog({
                 </>
               ) : (
                 <>
-                  {detailRow('Notional Value', `$${position.notionalValue.toLocaleString()}`)}
-                  {detailRow('Collateral Value', `$${position.collateralValue.toLocaleString()}`)}
-                  {detailRow('PnL',
-                    `${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
-                    pnl >= 0 ? '#00d4aa' : '#ef4444',
+                  {detailRow('Collateral Value',
+                    position.collateralValue ? `$${position.collateralValue.toLocaleString()}` : 'Encrypted',
+                    position.collateralValue ? undefined : 'rgba(255,255,255,0.25)',
                   )}
                   <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', mt: 1, fontStyle: 'italic' }}>
-                    Detailed liquidation breakdown not available (liquidated before this session)
+                    Detailed seizure breakdown not available (liquidated before this session)
                   </Typography>
                 </>
               )}
@@ -339,16 +531,27 @@ function PositionDetailDialog({
           </Box>
         )}
 
-        {/* Closed — simple close info */}
+        {/* Closed — close details with prices */}
         {position.status === 'Closed' && (
           <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 2 }}>
             <Typography sx={{ fontSize: 14, fontWeight: 600, color: 'white', mb: 1 }}>Close Details</Typography>
             {detailRow('Notional Value', `$${position.notionalValue.toLocaleString()}`)}
+            {detailRow('Units', position.units ? position.units.toLocaleString() : '-')}
+            {detailRow('Entry Price', position.entryPrice ? `$${position.entryPrice.toLocaleString()}` : '-')}
+            {detailRow('Closing Price', position.closingPrice ? `$${position.closingPrice.toLocaleString()}` : '-')}
             {detailRow('Final PnL',
               `${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
               pnl >= 0 ? '#00d4aa' : '#ef4444',
             )}
           </Box>
+        )}
+
+        {/* ZK Collateral Attestation */}
+        {position.zkCollateralProofHash && (
+          <ZKAttestationSection
+            proofHash={position.zkCollateralProofHash}
+            proofTimestamp={position.zkProofTimestamp}
+          />
         )}
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2 }}>
@@ -454,10 +657,10 @@ function FundPositions({ user }: { user: AuthUser }) {
     }
   };
 
-  const handleClose = async (contractId: string) => {
-    setClosing(contractId);
+  const handleClose = async (positionId: string) => {
+    setClosing(positionId);
     try {
-      await positionAPI.close(contractId);
+      await positionAPI.close(positionId);
       await loadData();
     } catch (error) {
       console.error('Error closing position:', error);
@@ -536,8 +739,8 @@ function FundPositions({ user }: { user: AuthUser }) {
             <TableHead>
               <TableRow>
                 <TableCell sx={thSx}>Position</TableCell>
+                <TableCell sx={thSx}>Asset</TableCell>
                 <TableCell sx={thSx}>Direction</TableCell>
-                <TableCell sx={thSx}>Description</TableCell>
                 <TableCell sx={thSx} align="right">Notional</TableCell>
                 <TableCell sx={thSx} align="right">Collateral</TableCell>
                 <TableCell sx={thSx} align="right">PnL</TableCell>
@@ -562,6 +765,12 @@ function FundPositions({ user }: { user: AuthUser }) {
                       <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Vault: {pos.vaultId}</Typography>
                     </TableCell>
                     <TableCell sx={tdSx}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        {pos.assetSymbol && <TokenIcon symbol={pos.assetSymbol} size={20} />}
+                        <Typography sx={{ fontSize: 13, fontWeight: 600 }}>{pos.assetSymbol || '-'}</Typography>
+                      </Box>
+                    </TableCell>
+                    <TableCell sx={tdSx}>
                       <Chip
                         label={pos.direction || 'Long'}
                         size="small"
@@ -573,9 +782,6 @@ function FundPositions({ user }: { user: AuthUser }) {
                           height: 20,
                         }}
                       />
-                    </TableCell>
-                    <TableCell sx={{ ...tdSx, color: 'rgba(255,255,255,0.6)', maxWidth: 150 }}>
-                      {pos.description || '-'}
                     </TableCell>
                     <TableCell sx={{ ...tdSx, fontWeight: 600 }} align="right">
                       ${pos.notionalValue.toLocaleString()}
@@ -615,8 +821,8 @@ function FundPositions({ user }: { user: AuthUser }) {
                         <Button
                           size="small"
                           startIcon={<Close />}
-                          onClick={(e) => { e.stopPropagation(); handleClose(pos.contractId); }}
-                          disabled={closing === pos.contractId}
+                          onClick={(e) => { e.stopPropagation(); handleClose(pos.positionId); }}
+                          disabled={closing === pos.positionId}
                           sx={{ color: 'rgba(255,255,255,0.4)', textTransform: 'none', fontSize: 11, minWidth: 0 }}
                         >
                           {closing === pos.contractId ? '...' : 'Close'}
@@ -983,10 +1189,10 @@ function BrokerPositions({ user }: { user: AuthUser }) {
 
   const handleLiquidateConfirm = async () => {
     if (!selectedPosition) return;
-    setLiquidating(selectedPosition.contractId);
+    setLiquidating(selectedPosition.positionId);
     setLiquidateError('');
     try {
-      await positionAPI.liquidate(selectedPosition.contractId);
+      await positionAPI.liquidate(selectedPosition.positionId);
       setOpenLiquidateConfirm(false);
       setSelectedPosition(null);
       await loadData();
@@ -1068,6 +1274,7 @@ function BrokerPositions({ user }: { user: AuthUser }) {
               <TableRow>
                 <TableCell sx={thSx}>Position</TableCell>
                 <TableCell sx={thSx}>Fund</TableCell>
+                <TableCell sx={thSx}>Asset</TableCell>
                 <TableCell sx={thSx}>Direction</TableCell>
                 <TableCell sx={thSx} align="right">Notional</TableCell>
                 <TableCell sx={thSx} align="right">Collateral</TableCell>
@@ -1094,11 +1301,22 @@ function BrokerPositions({ user }: { user: AuthUser }) {
                     }}
                   >
                     <TableCell sx={tdSx}>
-                      <Typography sx={{ fontSize: 13, fontWeight: 600 }}>{pos.positionId}</Typography>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                        <Typography sx={{ fontSize: 13, fontWeight: 600 }}>{pos.positionId}</Typography>
+                        {pos.zkCollateralProofHash && (
+                          <Shield sx={{ fontSize: 14, color: '#8b5cf6', opacity: 0.8 }} />
+                        )}
+                      </Box>
                       <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Vault: {pos.vaultId}</Typography>
                     </TableCell>
                     <TableCell sx={{ ...tdSx, color: 'rgba(255,255,255,0.6)', fontSize: 12 }}>
                       {pos.fund.split('::')[0]}
+                    </TableCell>
+                    <TableCell sx={tdSx}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        {pos.assetSymbol && <TokenIcon symbol={pos.assetSymbol} size={20} />}
+                        <Typography sx={{ fontSize: 13, fontWeight: 600 }}>{pos.assetSymbol || '-'}</Typography>
+                      </Box>
                     </TableCell>
                     <TableCell sx={tdSx}>
                       <Chip
@@ -1116,8 +1334,8 @@ function BrokerPositions({ user }: { user: AuthUser }) {
                     <TableCell sx={{ ...tdSx, fontWeight: 600 }} align="right">
                       ${pos.notionalValue.toLocaleString()}
                     </TableCell>
-                    <TableCell sx={{ ...tdSx, fontWeight: 600 }} align="right">
-                      ${pos.collateralValue.toLocaleString()}
+                    <TableCell sx={{ ...tdSx, fontWeight: 600, color: 'rgba(255,255,255,0.25)', fontStyle: pos.collateralValue ? 'normal' : 'italic' }} align="right">
+                      {pos.collateralValue ? `$${pos.collateralValue.toLocaleString()}` : 'Encrypted'}
                     </TableCell>
                     <TableCell sx={{ ...tdSx, fontWeight: 600, color: pos.unrealizedPnL >= 0 ? '#00d4aa' : '#ef4444' }} align="right">
                       {pos.unrealizedPnL >= 0 ? '+' : ''}${pos.unrealizedPnL.toLocaleString(undefined, { maximumFractionDigits: 2 })}
@@ -1204,9 +1422,9 @@ function BrokerPositions({ user }: { user: AuthUser }) {
                     { label: 'Current LTV', value: `${(selectedPosition.currentLTV * 100).toFixed(1)}%`, color: '#ef4444' },
                     { label: 'LTV Threshold', value: `${(threshold * 100).toFixed(0)}%`, color: '#f59e0b' },
                     { label: 'Notional Value', value: `$${selectedPosition.notionalValue.toLocaleString()}` },
-                    { label: 'Collateral Value', value: `$${selectedPosition.collateralValue.toLocaleString()}` },
+                    { label: 'Collateral Value', value: selectedPosition.collateralValue ? `$${selectedPosition.collateralValue.toLocaleString()}` : 'Encrypted', color: selectedPosition.collateralValue ? undefined : 'rgba(255,255,255,0.25)' },
                     { label: 'Unrealized PnL', value: `${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, color: pnl >= 0 ? '#00d4aa' : '#ef4444' },
-                    { label: 'Amount Owed (Loss)', value: `$${amountOwed.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, color: '#ef4444' },
+                    ...(selectedPosition.collateralValue ? [{ label: 'Amount Owed (Loss)', value: `$${amountOwed.toLocaleString(undefined, { maximumFractionDigits: 2 })}`, color: '#ef4444' }] : []),
                   ].map(row => (
                     <Box key={row.label} sx={{ display: 'flex', justifyContent: 'space-between', py: 0.8, borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
                       <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>{row.label}</Typography>

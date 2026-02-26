@@ -22,8 +22,8 @@ function toDecimal10(n: number): string {
 }
 
 // CPCV Package ID (deterministic hash - same across all participant nodes)
-// Must match the DAR file: daml/.daml/dist/cpcv-0.0.1.dar
-const CPCV_PACKAGE_ID = '4b60e70f9f90e2164c86529fe91dbacf858a0b0de2498a5366e33120691d09a6';
+// Must match the DAR file: daml/.daml/dist/privamargin6-0.1.0.dar
+const CPCV_PACKAGE_ID = '5240415c3ba99ccac4f73d5c8243d909cd08b8ec2bdf7c87c54645ad99595fb6';
 
 // Template IDs for PrivaMargin Daml contracts (from cpcv-hackathon)
 // Format: PackageId:ModuleName:TemplateName
@@ -95,6 +95,7 @@ const CHOICES = {
   MARK_MARGIN_CALLED: 'MarkMarginCalled',
   CLOSE_POSITION: 'ClosePosition',
   LIQUIDATE_POSITION: 'LiquidatePosition',
+  ATTEST_COLLATERAL: 'AttestCollateral',
   // WorkflowMarginCall choices
   ACKNOWLEDGE_MARGIN_CALL: 'AcknowledgeMarginCall',
   RESOLVE_MARGIN_CALL: 'ResolveMarginCall',
@@ -230,6 +231,26 @@ export function displaySymbol(symbol: string): string {
 export async function getLivePrice(symbol: string): Promise<number> {
   const prices = await fetchLivePrices();
   return prices[symbol] || FALLBACK_PRICES[symbol] || 1;
+}
+
+// Fetch recent price history for an asset from CoinGecko
+export async function getAssetPriceHistory(
+  symbol: string,
+  days: number = 7,
+): Promise<Array<{ time: number; price: number }>> {
+  const geckoId = COINGECKO_IDS[symbol];
+  if (!geckoId) return [];
+  try {
+    const res = await fetch(
+      `https://api.coingecko.com/api/v3/coins/${geckoId}/market_chart?vs_currency=usd&days=${days}`,
+    );
+    const data = await res.json() as { prices?: Array<[number, number]> };
+    if (!data.prices) return [];
+    return data.prices.map(([time, price]) => ({ time, price }));
+  } catch (err) {
+    console.warn('Failed to fetch price history from CoinGecko:', err);
+    return [];
+  }
 }
 
 // Mock data storage (fallback when Canton is not available)
@@ -2083,6 +2104,23 @@ export const linkAPI = {
     return { data: [] };
   },
 
+  setAutoLiquidate: async (broker: string, fund: string, enabled: boolean) => {
+    const resp = await fetch('/api/auto-liquidate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ broker, fund, enabled }),
+    });
+    if (!resp.ok) throw new Error('Failed to set auto-liquidate preference');
+    return await resp.json() as { success: boolean };
+  },
+
+  getAutoLiquidatePrefs: async (broker: string): Promise<Record<string, boolean>> => {
+    const resp = await fetch(`/api/auto-liquidate?broker=${encodeURIComponent(broker)}`);
+    if (!resp.ok) return {};
+    const data = await resp.json() as { preferences: Record<string, boolean> };
+    return data.preferences || {};
+  },
+
   setLTVThreshold: async (contractId: string, newThreshold: number) => {
     if (sdk) {
       try {
@@ -2270,7 +2308,7 @@ export const proposalAPI = {
         const positions = await positionAPI.listByFund(fundParty);
         for (const pos of positions.data.filter(p => p.broker === linkBroker && p.status === 'Open')) {
           try {
-            await positionAPI.close(pos.contractId);
+            await positionAPI.close(pos.positionId);
           } catch (err) {
             console.warn('Failed to close position:', pos.positionId, err);
           }
@@ -2294,16 +2332,20 @@ export interface PositionData {
   positionId: string;
   vaultId: string;
   description: string;
+  assetSymbol: string;
   direction: 'Long' | 'Short';
   notionalValue: number;
   entryPrice: number;
   units: number;
   unrealizedPnL: number;
+  closingPrice: number;
   collateralValue: number;
   currentLTV: number;
   status: string;
   createdAt: string;
   lastChecked: string;
+  zkCollateralProofHash?: string;
+  zkProofTimestamp?: string;
 }
 
 export interface LiquidationRecord {
@@ -2349,6 +2391,9 @@ function contractToPosition(c: CantonContract<Record<string, unknown>>): Positio
   // direction is Optional PositionDirection — could be null, "Long", "Short"
   const rawDir = p.direction;
   const direction: 'Long' | 'Short' = rawDir === 'Short' ? 'Short' : 'Long';
+  // Parse asset symbol from description (e.g. "LONG 2 BTC" → "BTC")
+  const desc = (p.description as string) || '';
+  const assetSymbol = desc.trim().split(/\s+/).pop() || '';
 
   return {
     contractId: c.contractId,
@@ -2357,18 +2402,46 @@ function contractToPosition(c: CantonContract<Record<string, unknown>>): Positio
     operator: p.operator as string,
     positionId: p.positionId as string,
     vaultId: p.vaultId as string,
-    description: p.description as string,
+    description: desc,
+    assetSymbol,
     direction,
     notionalValue: parseDecimal(p.notionalValue),
     entryPrice: parseDecimal(p.entryPrice),
     units: parseDecimal(p.units),
     unrealizedPnL: parseDecimal(p.unrealizedPnL),
+    closingPrice: parseDecimal(p.closingPrice),
     collateralValue: 0,
     currentLTV: parseDecimal(p.currentLTV),
     status: p.status as string,
     createdAt: p.createdAt as string,
     lastChecked: p.lastChecked as string,
+    zkCollateralProofHash: (p.zkCollateralProofHash as string) || undefined,
+    zkProofTimestamp: (p.zkProofTimestamp as string) || undefined,
   };
+}
+
+// ZK proof KV helpers — store/fetch full proofs via Pages Function
+async function storeZKProofToKV(hash: string, proofData: unknown): Promise<void> {
+  try {
+    await fetch('/api/zkproof', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hash, proof: proofData }),
+    });
+  } catch {
+    // fire-and-forget — ZK storage failure is non-critical
+  }
+}
+
+export async function fetchZKProof(hash: string): Promise<unknown | null> {
+  try {
+    const res = await fetch(`/api/zkproof?hash=${encodeURIComponent(hash)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data as Record<string, unknown>).proof || null;
+  } catch {
+    return null;
+  }
 }
 
 // Recalculate position collateralValue, PnL, and LTV with live prices.
@@ -2391,8 +2464,11 @@ async function recalcPositionsLive(positions: PositionData[]): Promise<PositionD
     } catch { /* use 0 */ }
   }
 
-  // Compute per-position PnL
+  // Compute per-position PnL (only for active positions; closed/liquidated keep their on-ledger value)
   const withPnL = positions.map(pos => {
+    if (pos.status === 'Closed' || pos.status === 'Liquidated') {
+      return pos;
+    }
     const entryPrice = pos.entryPrice || 0;
     const units = pos.units || 0;
     const symbol = pos.description.trim().split(/\s+/).pop() || '';
@@ -2416,14 +2492,98 @@ async function recalcPositionsLive(positions: PositionData[]): Promise<PositionD
   }
 
   // Recalc collateralValue and LTV
-  return withPnL.map(pos => {
-    const collateral = vaultValues[pos.vaultId] || 0;
+  const result = withPnL.map(pos => {
+    const collateral = vaultValues[pos.vaultId];
+    // If vault wasn't visible (e.g. broker can't see fund's vault), keep on-ledger LTV
+    if (collateral === undefined) {
+      return pos;
+    }
     const agg = vaultAgg[pos.vaultId];
     const effectiveCollateral = collateral + (agg?.totalPnL || 0);
     const totalNotional = agg?.totalNotional || pos.notionalValue;
     const ltv = effectiveCollateral > 0 ? totalNotional / effectiveCollateral : (totalNotional > 0 ? 999 : 0);
     return { ...pos, collateralValue: collateral, currentLTV: ltv };
   });
+
+  // ZK proof generation — fund only, one proof per vault, skip if recent proof exists
+  try {
+    const currentParty = await sdk.getPartyId?.() || '';
+    const fundParties = [...new Set(result.map(p => p.fund))];
+    const isFund = fundParties.includes(currentParty);
+
+    if (isFund) {
+      const { generateLTVProof, proofHash: computeProofHash, usdToCents, isZKAvailable } =
+        await import('./zkProof');
+
+      if (await isZKAvailable()) {
+        // Group active positions by vault
+        const vaultPositions: Record<string, PositionData[]> = {};
+        for (const pos of result) {
+          if (pos.status !== 'Open' && pos.status !== 'MarginCalled') continue;
+          if (pos.fund !== currentParty) continue;
+          if (!vaultPositions[pos.vaultId]) vaultPositions[pos.vaultId] = [];
+          vaultPositions[pos.vaultId].push(pos);
+        }
+
+        const ZK_PROOF_MIN_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+        for (const [vid, vPositions] of Object.entries(vaultPositions)) {
+          // Skip if existing proof < 5 min old
+          const existingTs = vPositions[0]?.zkProofTimestamp;
+          if (existingTs && (Date.now() - new Date(existingTs).getTime()) < ZK_PROOF_MIN_INTERVAL) {
+            continue;
+          }
+
+          const collateral = vaultValues[vid];
+          if (collateral === undefined || collateral <= 0) continue;
+
+          const agg = vaultAgg[vid];
+          const totalNotional = agg?.totalNotional || 0;
+          if (totalNotional <= 0) continue;
+
+          // Generate ZK proof attesting raw collateral sufficiency
+          const zkResult = await generateLTVProof({
+            assetValuesCents: [usdToCents(collateral)],
+            notionalValueCents: usdToCents(totalNotional),
+            ltvThresholdBps: 8000, // 80% standard threshold
+          });
+
+          const hash = await computeProofHash(zkResult.proof);
+          const attestedAt = new Date().toISOString();
+
+          // Store full proof to KV (fire-and-forget)
+          storeZKProofToKV(hash, {
+            proof: zkResult.proof,
+            publicSignals: zkResult.publicSignals,
+            computedLTVBps: zkResult.computedLTVBps,
+            vaultId: vid,
+            attestedAt,
+          });
+
+          // Exercise AttestCollateral on each position sharing this vault
+          for (const pos of vPositions) {
+            try {
+              await sdk.cantonExercise({
+                templateId: TEMPLATE_IDS.POSITION,
+                contractId: pos.contractId,
+                choice: CHOICES.ATTEST_COLLATERAL,
+                argument: { proofHash: hash, attestedAt },
+              });
+              // Update local result with new ZK fields
+              pos.zkCollateralProofHash = hash;
+              pos.zkProofTimestamp = attestedAt;
+            } catch {
+              // Individual attestation failure is non-critical
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // ZK proof generation failure never blocks position loading
+  }
+
+  return result;
 }
 
 export const positionAPI = {
@@ -2494,6 +2654,9 @@ export const positionAPI = {
             entryPrice: entryPrice > 0 ? toDecimal10(entryPrice) : null,
             units: units > 0 ? toDecimal10(units) : null,
             unrealizedPnL: toDecimal10(0),
+            closingPrice: null,
+            zkCollateralProofHash: null,
+            zkProofTimestamp: null,
             currentLTV: toDecimal10(currentLTV),
             status: 'Open',
             createdAt: now,
@@ -2541,14 +2704,44 @@ export const positionAPI = {
     return { data: [] };
   },
 
-  close: async (contractId: string) => {
+  close: async (positionId: string) => {
     if (sdk) {
       try {
+        // Helper: resolve current active contract for this positionId
+        const resolveCurrentCid = async (): Promise<{ cid: string; pos: PositionData }> => {
+          const results = await sdk!.cantonQuery({
+            templateId: TEMPLATE_IDS.POSITION,
+            filter: { positionId },
+          });
+          const active = results.find(c => {
+            const s = (c.payload as Record<string, unknown>).status as string;
+            return s === 'Open' || s === 'MarginCalled';
+          });
+          if (!active) throw new Error('Active position not found for ' + positionId);
+          return { cid: active.contractId, pos: contractToPosition(active) };
+        };
+
+        let { cid: currentCid, pos } = await resolveCurrentCid();
+
+        // Compute final PnL and closing price
+        const prices = await fetchLivePrices();
+        const symbol = pos.description.trim().split(/\s+/).pop() || '';
+        const currentPrice = prices[symbol] || 0;
+        let finalPnL = 0;
+        if (pos.entryPrice && pos.units && currentPrice) {
+          finalPnL = pos.direction === 'Short'
+            ? pos.units * (pos.entryPrice - currentPrice)
+            : pos.units * (currentPrice - pos.entryPrice);
+        }
+
         await sdk.cantonExercise({
-          contractId,
+          contractId: currentCid,
           templateId: TEMPLATE_IDS.POSITION,
           choice: CHOICES.CLOSE_POSITION,
-          argument: {},
+          argument: {
+            finalPnL: toDecimal10(finalPnL),
+            exitPrice: currentPrice > 0 ? toDecimal10(currentPrice) : null,
+          },
         });
         return { data: { success: true } };
       } catch (error) {
@@ -2559,15 +2752,20 @@ export const positionAPI = {
     throw new Error('SDK not available');
   },
 
-  liquidate: async (contractId: string) => {
+  liquidate: async (positionId: string) => {
     if (!sdk) throw new Error('SDK not available');
 
-    // 1. Query Position to get fund, broker, vaultId, currentLTV, notionalValue, collateralValue, status
+    // 1. Query Position by positionId to get the current (non-stale) contract.
+    //    Contract IDs change on every Daml exercise, so we always resolve fresh.
     const positions = await sdk.cantonQuery({
       templateId: TEMPLATE_IDS.POSITION,
+      filter: { positionId },
     });
-    const posContract = positions.find(c => c.contractId === contractId);
-    if (!posContract) throw new Error('Position not found');
+    const posContract = positions.find(c => {
+      const s = (c.payload as Record<string, unknown>).status as string;
+      return s === 'Open' || s === 'MarginCalled';
+    });
+    if (!posContract) throw new Error('Active position not found for ' + positionId);
 
     const pos = contractToPosition(posContract);
 
@@ -3084,19 +3282,44 @@ export const positionAPI = {
       brokerCantonParty,
     });
 
-    // 11. Exercise LiquidatePosition on Canton
+    // 11. Snapshot PnL, then exercise LiquidatePosition on Canton
     //     LiquidatePosition has `controller operator` so we must include the
     //     operator party in actAs even when the broker initiates the call.
+    //     The contract ID can go stale at any point (workflow races), so we
+    //     re-resolve before each exercise.
     const operatorParty = await getOperatorParty();
     const actAsParties = operatorParty ? [operatorParty] : [];
+
+    // Helper: resolve the current active contract ID for this positionId
+    const resolveCurrentCid = async (): Promise<string> => {
+      const fresh = await sdk!.cantonQuery({
+        templateId: TEMPLATE_IDS.POSITION,
+        filter: { positionId },
+      });
+      const active = fresh.find(c => {
+        const s = (c.payload as Record<string, unknown>).status as string;
+        return s === 'Open' || s === 'MarginCalled';
+      });
+      if (!active) throw new Error('Position no longer active (may have been liquidated by workflow)');
+      return active.contractId;
+    };
+
+    // Resolve the current contract and compute closing price
+    const activeContractId = await resolveCurrentCid();
+    const prices = await fetchLivePrices();
+    const symbol = pos.description.trim().split(/\s+/).pop() || '';
+    const currentPrice = prices[symbol] || 0;
+
     await sdk.cantonExercise({
-      contractId,
+      contractId: activeContractId,
       templateId: TEMPLATE_IDS.POSITION,
       choice: CHOICES.LIQUIDATE_POSITION,
       argument: {
         ltvThreshold: toDecimal10(ltvThreshold),
         liquidatedAmount: toDecimal10(liquidationAmountUSD),
         liquidatedAt,
+        finalPnL: toDecimal10(pnl),
+        exitPrice: currentPrice > 0 ? toDecimal10(currentPrice) : null,
       },
       actAs: actAsParties,
     });
