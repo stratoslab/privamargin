@@ -161,11 +161,11 @@ function mapAssetTypeToEnum(assetType: string): string {
   return 'Cryptocurrency';
 }
 
-// Fallback asset prices (wallet SDK supported tokens only)
+// Fallback asset prices — updated Feb 2026 (used only when CoinGecko is unreachable)
 const FALLBACK_PRICES: Record<string, number> = {
-  'BTC': 95000,
-  'ETH': 3500,
-  'SOL': 180,
+  'BTC': 68000,
+  'ETH': 2050,
+  'SOL': 88,
   'CC': 0.158,
   'USDC': 1,
   'USDT': 1,
@@ -191,6 +191,7 @@ const COINGECKO_IDS: Record<string, string> = {
 // Live price cache
 let livePriceCache: Record<string, number> = {};
 let livePriceCacheTime = 0;
+let livePricesAreFresh = false; // true when CoinGecko responded successfully
 const PRICE_CACHE_TTL = 60_000; // 1 minute
 
 // Fetch live prices directly from CoinGecko (same source as wallet SDK)
@@ -207,17 +208,21 @@ async function fetchLivePrices(): Promise<Record<string, number>> {
     const data = await res.json() as Record<string, { usd?: number }>;
 
     const prices: Record<string, number> = { ...FALLBACK_PRICES };
+    let gotLive = false;
     for (const [symbol, geckoId] of Object.entries(COINGECKO_IDS)) {
       if (data[geckoId]?.usd) {
         prices[symbol] = data[geckoId].usd;
+        gotLive = true;
       }
     }
     livePriceCache = prices;
     livePriceCacheTime = now;
+    livePricesAreFresh = gotLive;
     return livePriceCache;
   } catch (err) {
     console.warn('Failed to fetch live prices from CoinGecko, using fallback:', err);
   }
+  livePricesAreFresh = false;
   return FALLBACK_PRICES;
 }
 
@@ -233,6 +238,11 @@ export function displaySymbol(symbol: string): string {
 export async function getLivePrice(symbol: string): Promise<number> {
   const prices = await fetchLivePrices();
   return prices[symbol] || FALLBACK_PRICES[symbol] || 1;
+}
+
+// Returns true if the most recent fetchLivePrices got real CoinGecko data (not stale fallback)
+export function arePricesFresh(): boolean {
+  return livePricesAreFresh;
 }
 
 // Fetch recent price history for an asset from CoinGecko
@@ -2662,6 +2672,16 @@ export const positionAPI = {
   ) => {
     if (sdk) {
       try {
+        // Guard: reject position creation if entry price came from stale fallback
+        if (entryPrice > 0 && !arePricesFresh()) {
+          // Force a fresh fetch (cache might be stale)
+          livePriceCacheTime = 0;
+          await fetchLivePrices();
+          if (!arePricesFresh()) {
+            throw new Error('Cannot create position: unable to fetch live market price. Please try again.');
+          }
+        }
+
         // Get vault value with live prices for initial LTV calculation
         let collateralValue = 0;
         try {

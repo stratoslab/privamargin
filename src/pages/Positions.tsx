@@ -610,8 +610,9 @@ function FundPositions({ user }: { user: AuthUser }) {
     positions.filter(p => p.vaultId === vaultId && (p.status === 'Open' || p.status === 'MarginCalled'))
       .reduce((sum, p) => sum + p.notionalValue, 0);
 
+  const selectedLeverage = selectedLink?.leverageRatio || 1;
   const ltvPreview = selectedVault && selectedVault.totalValue > 0
-    ? (existingNotionalOnVault(selectedVault.vaultId) + notionalValue) / selectedVault.totalValue
+    ? (existingNotionalOnVault(selectedVault.vaultId) + notionalValue) / (selectedVault.totalValue * selectedLeverage)
     : 0;
 
   // Fetch live price when asset changes
@@ -636,15 +637,19 @@ function FundPositions({ user }: { user: AuthUser }) {
       const operator = selectedLink?.operator || partyId;
       const description = `${form.direction.toUpperCase()} ${form.units} ${form.asset}`;
 
+      // Re-fetch live price right before creation to avoid stale fallback
+      const freshPrice = await getLivePrice(form.asset);
+      const freshNotional = parseFloat(form.units) * freshPrice;
+
       await positionAPI.create(
         partyId,
         form.broker,
         operator,
         form.vaultId,
         description,
-        notionalValue,
+        freshNotional,
         form.direction,
-        livePrice || 0,
+        freshPrice,
         parseFloat(form.units) || 0,
       );
       setOpenCreate(false);
@@ -896,6 +901,10 @@ function FundPositions({ user }: { user: AuthUser }) {
                       <Box sx={{ display: 'flex', gap: 1 }}>
                         <Chip label={`LTV ${(link.ltvThreshold * 100).toFixed(0)}%`} size="small"
                           sx={{ bgcolor: 'rgba(245,158,11,0.15)', color: '#f59e0b', fontWeight: 600, fontSize: 11 }} />
+                        {link.leverageRatio > 1 && (
+                          <Chip label={`${link.leverageRatio}x`} size="small"
+                            sx={{ bgcolor: 'rgba(59,130,246,0.15)', color: '#3b82f6', fontWeight: 600, fontSize: 11 }} />
+                        )}
                         <Chip label={`${link.allowedAssets?.length || 0} assets`} size="small"
                           sx={{ bgcolor: 'rgba(139,92,246,0.15)', color: '#8b5cf6', fontWeight: 600, fontSize: 11 }} />
                       </Box>
@@ -1017,7 +1026,8 @@ function FundPositions({ user }: { user: AuthUser }) {
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
                 {vaults.map((v: any) => {
                   const totalNotional = existingNotionalOnVault(v.vaultId) + notionalValue;
-                  const projectedLTV = v.totalValue > 0 ? totalNotional / v.totalValue : 0;
+                  const leverage = selectedLink?.leverageRatio || 1;
+                  const projectedLTV = v.totalValue > 0 ? totalNotional / (v.totalValue * leverage) : 0;
                   const threshold = selectedLink?.ltvThreshold || 0.8;
                   const ltvColor = getLTVColor(projectedLTV, threshold);
                   return (
