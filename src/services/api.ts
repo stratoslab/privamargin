@@ -3221,47 +3221,41 @@ export const positionAPI = {
       }
 
       if (seizedVaultAssets.length > 0) {
-        try {
-          // Read the vault's actual operator party (may be custodian, not the config operator)
-          const freshVaults = await sdk.cantonQuery({
-            templateId: TEMPLATE_IDS.VAULT,
-            filter: { vaultId: pos.vaultId },
-          });
-          let vaultCid = freshVaults[0]?.contractId;
-          const vaultOperator = freshVaults[0]
-            ? (freshVaults[0].payload as Record<string, unknown>).operator as string
-            : null;
-          // Fallback chain: vault operator → custodian → config operator
-          const seizeParty = vaultOperator || await getCustodianParty() || await getOperatorParty();
-          const seizeActAs = seizeParty ? [seizeParty] : [];
+        // Exercise SeizeCollateral via server-side endpoint (the vault's operator
+        // is the custodian party, which the wallet SDK can't actAs).
+        const freshVaults = await sdk.cantonQuery({
+          templateId: TEMPLATE_IDS.VAULT,
+          filter: { vaultId: pos.vaultId },
+        });
+        let vaultCid = freshVaults[0]?.contractId;
 
-          if (vaultCid) {
-            for (const seized of seizedVaultAssets) {
-              try {
-                const seizeResult = await sdk.cantonExercise({
+        if (vaultCid) {
+          for (const seized of seizedVaultAssets) {
+            try {
+              const seizeRes = await fetch('/api/canton/seize-collateral', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
                   contractId: vaultCid,
                   templateId: TEMPLATE_IDS.VAULT,
-                  choice: CHOICES.SEIZE_COLLATERAL,
-                  argument: {
-                    assetId: seized.assetId,
-                    seizeAmount: seized.amount.toString(),
-                    reason: `Liquidation of position ${pos.positionId}`,
-                  },
-                  actAs: seizeActAs,
-                });
-                // SeizeCollateral archives old contract — use new contractId
-                const newCid = seizeResult.events?.find(
-                  (e: { templateId: string }) => e.templateId.includes('CollateralVault')
-                )?.contractId;
-                if (newCid) vaultCid = newCid;
-                console.log(`[Liquidation] SeizeCollateral: ${seized.assetId} ${seized.amount} ($${seized.valueUSD.toFixed(2)})`);
-              } catch (err) {
-                console.warn(`[Liquidation] SeizeCollateral failed for ${seized.assetId}:`, err);
+                  assetId: seized.assetId,
+                  seizeAmount: seized.amount.toString(),
+                  reason: `Liquidation of position ${pos.positionId}`,
+                }),
+              });
+              const seizeData = await seizeRes.json() as { success?: boolean; newContractId?: string; error?: string };
+              if (seizeData.success && seizeData.newContractId) {
+                vaultCid = seizeData.newContractId;
               }
+              if (seizeData.success) {
+                console.log(`[Liquidation] SeizeCollateral: ${seized.assetId} ${seized.amount} ($${seized.valueUSD.toFixed(2)})`);
+              } else {
+                console.warn(`[Liquidation] SeizeCollateral failed for ${seized.assetId}: ${seizeData.error}`);
+              }
+            } catch (err) {
+              console.warn(`[Liquidation] SeizeCollateral failed for ${seized.assetId}:`, err);
             }
           }
-        } catch (err) {
-          console.warn('[Liquidation] SeizeCollateral setup failed:', err);
         }
       }
     }
