@@ -6,6 +6,7 @@ import {
 } from '@mui/material';
 import { Lock, OpenInNew, AccountBalance, Warning } from '@mui/icons-material';
 import { vaultAPI, getLivePrice, getCustodianParty, displaySymbol } from '../services/api';
+import TokenIcon from '../components/TokenIcon';
 import { getDefaultChainId, CHAIN_NAME_TO_ID, CHAIN_CONFIG, isSameChain, isEVMChain, resolveChainId } from '../services/evmEscrow';
 import type { AuthUser, Asset } from '@stratos-wallet/sdk';
 
@@ -390,43 +391,45 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
     const chainBals = vault.chainBalancesBySymbol?.[symbol] as Record<string, number> | undefined;
     const evmEscrows: any[] = (vault.chainVaults || []).filter((cv: any) => isEVMChain(cv.chain));
 
-    if (!chainBals) {
-      // No depositRecords — fallback: show all escrows with total asset amount
-      for (const cv of evmEscrows) {
-        chainMap.set(cv.chain, asset.amount);
-      }
-      return Array.from(chainMap.entries()).map(([chain, balance]) => ({ chain, balance }));
-    }
+    if (chainBals) {
+      for (const [chain, balance] of Object.entries(chainBals)) {
+        if (balance <= 0) continue;
 
-    for (const [chain, balance] of Object.entries(chainBals)) {
-      if (balance <= 0) continue;
+        // Canton-held (chain = 'canton' or 'Canton') — normalize to 'Canton'
+        if (chain.toLowerCase() === 'canton') {
+          chainMap.set('Canton', (chainMap.get('Canton') || 0) + balance);
+          continue;
+        }
 
-      // Canton-held (chain = 'canton' or 'Canton') — normalize to 'Canton'
-      if (chain.toLowerCase() === 'canton') {
-        chainMap.set('Canton', (chainMap.get('Canton') || 0) + balance);
-        continue;
-      }
+        // Specific EVM chain name (e.g. 'Ethereum', 'Base') — match against escrow
+        if (evmEscrows.some((cv: any) => cv.chain === chain)) {
+          chainMap.set(chain, (chainMap.get(chain) || 0) + balance);
+          continue;
+        }
 
-      // Specific EVM chain name (e.g. 'Ethereum', 'Base') — match against escrow
-      if (evmEscrows.some((cv: any) => cv.chain === chain)) {
-        chainMap.set(chain, (chainMap.get(chain) || 0) + balance);
-        continue;
-      }
-
-      // Legacy generic 'evm' — map to available escrows that don't already have specific entries
-      if (chain === 'evm') {
-        // Only assign to escrows that don't already have a specific chain entry in chainBals
-        // to avoid double-counting (e.g. 'evm': 0.2 + 'Base': 0.2 = 0.4 on Base)
-        const escrowsWithoutSpecific = evmEscrows.filter((cv: any) => !chainBals[cv.chain]);
-        if (escrowsWithoutSpecific.length === 1) {
-          chainMap.set(escrowsWithoutSpecific[0].chain, (chainMap.get(escrowsWithoutSpecific[0].chain) || 0) + balance);
-        } else if (escrowsWithoutSpecific.length > 1) {
-          // Can't determine which escrow the legacy deposit was on — distribute to each
-          for (const cv of escrowsWithoutSpecific) {
-            chainMap.set(cv.chain, (chainMap.get(cv.chain) || 0) + balance);
+        // Legacy generic 'evm' — map to available escrows that don't already have specific entries
+        if (chain === 'evm') {
+          const escrowsWithoutSpecific = evmEscrows.filter((cv: any) => !chainBals[cv.chain]);
+          if (escrowsWithoutSpecific.length === 1) {
+            chainMap.set(escrowsWithoutSpecific[0].chain, (chainMap.get(escrowsWithoutSpecific[0].chain) || 0) + balance);
+          } else if (escrowsWithoutSpecific.length > 1) {
+            for (const cv of escrowsWithoutSpecific) {
+              chainMap.set(cv.chain, (chainMap.get(cv.chain) || 0) + balance);
+            }
           }
         }
-        // If all escrows already have specific entries, skip 'evm' to avoid double-counting
+      }
+    }
+
+    // If chainMap is still empty (no deposit records, or chain names didn't match),
+    // fall back: show EVM escrows if any, otherwise offer Canton withdraw
+    if (chainMap.size === 0) {
+      if (evmEscrows.length > 0) {
+        for (const cv of evmEscrows) {
+          chainMap.set(cv.chain, asset.amount);
+        }
+      } else if (asset.amount > 0) {
+        chainMap.set('Canton', asset.amount);
       }
     }
 
@@ -523,7 +526,8 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
                             <ListItemText
                               primary={
                                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                  <span>{displaySymbol(asset.assetType)} — {asset.amount.toLocaleString()}</span>
+                                  <TokenIcon symbol={asset.assetType} size={20} />
+                                  <span>{displaySymbol(asset.assetType)} — {asset.amount.toLocaleString(undefined, { maximumFractionDigits: 5 })}</span>
                                   {canWithdraw && (
                                     <Chip
                                       label="Withdraw"
@@ -709,7 +713,7 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
               {walletAssets.length > 0 ? (
                 walletAssets.map((a) => (
                   <MenuItem key={a.symbol} value={a.symbol}>
-                    {a.symbol} &mdash; Balance: {a.balance.toLocaleString()}
+                    {a.symbol} &mdash; Balance: {a.balance.toLocaleString(undefined, { maximumFractionDigits: 5 })}
                   </MenuItem>
                 ))
               ) : (
@@ -737,7 +741,7 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
                 {availableChains.map((ac) => (
                   <MenuItem key={ac.chain} value={ac.chain}>
                     {ac.chain}
-                    {chainBalances[ac.chain] !== undefined ? ` — ${chainBalances[ac.chain].toLocaleString()} ${depositForm.walletAssetSymbol}` : ''}
+                    {chainBalances[ac.chain] !== undefined ? ` — ${chainBalances[ac.chain].toLocaleString(undefined, { maximumFractionDigits: 5 })} ${depositForm.walletAssetSymbol}` : ''}
                   </MenuItem>
                 ))}
               </Select>
@@ -758,7 +762,7 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
             }}
             helperText={
               depositForm.walletAssetSymbol
-                ? `Max: ${getMaxBalance().toLocaleString()}${depositForm.chain ? ` (${depositForm.chain})` : ''}`
+                ? `Max: ${getMaxBalance().toLocaleString(undefined, { maximumFractionDigits: 5 })}${depositForm.chain ? ` (${depositForm.chain})` : ''}`
                 : 'Select an asset first'
             }
           />
@@ -857,7 +861,7 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
               >
                 {withdrawChainOptions.map((opt) => (
                   <MenuItem key={opt.chain} value={opt.chain}>
-                    {opt.chain} — {opt.balance.toLocaleString()} {displaySymbol(withdrawAssetSymbol)}
+                    {opt.chain} — {opt.balance.toLocaleString(undefined, { maximumFractionDigits: 5 })} {displaySymbol(withdrawAssetSymbol)}
                   </MenuItem>
                 ))}
               </Select>
@@ -876,7 +880,7 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
               setWithdrawAmount(val > 0 ? val.toString() : e.target.value);
             }}
             disabled={withdrawing || (withdrawChainOptions.length > 1 && !withdrawChain)}
-            helperText={`Available: ${withdrawMaxAmount.toLocaleString()} ${displaySymbol(withdrawAssetSymbol)}`}
+            helperText={`Available: ${withdrawMaxAmount.toLocaleString(undefined, { maximumFractionDigits: 5 })} ${displaySymbol(withdrawAssetSymbol)}`}
           />
         </DialogContent>
         <DialogActions>
