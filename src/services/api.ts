@@ -63,6 +63,7 @@ const CHOICES = {
   GET_VAULT_VALUE: 'GetVaultValue',
   GET_VAULT_INFO: 'GetVaultInfo',
   CLOSE_VAULT: 'CloseVault',
+  SEIZE_COLLATERAL: 'SeizeCollateral',
   // MarginRequirement choices
   VERIFY_MARGIN: 'VerifyMargin',
   TRIGGER_MARGIN_CALL: 'TriggerMarginCall',
@@ -3323,6 +3324,64 @@ export const positionAPI = {
       // Collect escrow records for LiquidationRecord
       for (const record of escrowRecordMap.values()) {
         escrowLiquidations.push(record);
+      }
+
+      // Exercise SeizeCollateral for EVM-seized assets (vault Daml record still shows them)
+      // Canton assets are handled by WithdrawAsset + re-deposit above, but EVM assets
+      // only get seized on-chain — the vault's collateralAssets is not updated.
+      const evmSeizedAssets: Array<{ assetId: string; amount: number; valueUSD: number }> = [];
+      for (const plan of seizurePlan) {
+        if ((plan.type === 'USDC' || plan.type === 'ETH') && plan.seizeUSD > 0 && !plan.assetId) {
+          // Map EVM type back to vault collateralAssets entry
+          const symbol = plan.type;
+          const vaultEntry = vault.collateralAssets.find(a => a.assetId.split('-')[0].toUpperCase() === symbol);
+          if (vaultEntry) {
+            const seizedAmount = plan.type === 'USDC'
+              ? Number(plan.seizeWei || 0n) / 1e6
+              : Number(plan.seizeWei || 0n) / 1e18;
+            evmSeizedAssets.push({ assetId: vaultEntry.assetId, amount: seizedAmount, valueUSD: plan.seizeUSD });
+          }
+        }
+      }
+
+      if (evmSeizedAssets.length > 0) {
+        try {
+          const seizeOperator = await getOperatorParty();
+          const seizeActAs = seizeOperator ? [seizeOperator] : [];
+          const freshVaults = await sdk.cantonQuery({
+            templateId: TEMPLATE_IDS.VAULT,
+            filter: { vaultId: pos.vaultId },
+          });
+          let vaultCid = freshVaults[0]?.contractId;
+
+          if (vaultCid) {
+            for (const seized of evmSeizedAssets) {
+              try {
+                const seizeResult = await sdk.cantonExercise({
+                  contractId: vaultCid,
+                  templateId: TEMPLATE_IDS.VAULT,
+                  choice: CHOICES.SEIZE_COLLATERAL,
+                  argument: {
+                    assetId: seized.assetId,
+                    seizeAmount: seized.amount.toString(),
+                    reason: `Liquidation of position ${pos.positionId}`,
+                  },
+                  actAs: seizeActAs,
+                });
+                // SeizeCollateral archives old contract — use new contractId
+                const newCid = seizeResult.events?.find(
+                  (e: { templateId: string }) => e.templateId.includes('CollateralVault')
+                )?.contractId;
+                if (newCid) vaultCid = newCid;
+                console.log(`[Liquidation] SeizeCollateral: ${seized.assetId} ${seized.amount} ($${seized.valueUSD.toFixed(2)})`);
+              } catch (err) {
+                console.warn(`[Liquidation] SeizeCollateral failed for ${seized.assetId}:`, err);
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('[Liquidation] SeizeCollateral setup failed:', err);
+        }
       }
     }
     const escrowTxHash = escrowTxHashes[0];
