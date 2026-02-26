@@ -2895,7 +2895,6 @@ export const positionAPI = {
     // Only perform seizure if there is an amount owed AND vault exists
     if (liquidationAmountUSD > 0 && vaults.length > 0) {
       const vault = contractToVault(vaults[0]);
-      const owner = (vaults[0].payload as Record<string, unknown>).owner as string;
       const evmEscrows = vault.chainVaults.filter(cv => isEVMChain(cv.chain));
       const ccAssets = vault.collateralAssets.filter(a => a.assetType === 'CC');
       const cusdcAssets = vault.collateralAssets.filter(a => a.assetType === 'CUSDC');
@@ -3140,195 +3139,47 @@ export const positionAPI = {
           }
 
         } else if (plan.type === 'USDC_CANTON' && plan.seizeNum && plan.seizeNum > 0) {
-          // Canton USDC: withdraw from vault, then transfer USDCHolding to broker
-          const isPartial = plan.seizeNum < plan.balanceNum!;
+          // Canton USDC: record seizure, vault depletion handled by SeizeCollateral below
           try {
-            const freshVaults = await sdk.cantonQuery({
-              templateId: TEMPLATE_IDS.VAULT,
-              filter: { vaultId: pos.vaultId }
-            });
-            if (freshVaults.length === 0) continue;
-
-            await sdk.cantonExercise({
-              contractId: freshVaults[0].contractId,
-              templateId: TEMPLATE_IDS.VAULT,
-              choice: CHOICES.WITHDRAW_ASSET,
-              argument: { assetId: plan.assetId!, issuer: owner }
-            });
-            console.log(`[Liquidation] Canton USDC withdrawn from vault: ${plan.balanceNum} (seizing ${plan.seizeNum.toFixed(4)})`);
-
             // Transfer via Canton JSON API (USDCHolding Split+Transfer)
-            try {
-              const withdrawRes = await fetch('/api/custodian/withdraw-usdc', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ receiverParty: pos.broker, amount: plan.seizeNum }),
-              });
-              const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
-              if (!withdrawRes.ok || !withdrawData.success) {
-                console.warn(`[Liquidation] Canton USDC transfer to broker failed:`, withdrawData.error);
-              } else {
-                console.log(`[Liquidation] Canton USDC transferred to broker: ${plan.seizeNum} USDC`);
-              }
-            } catch (err) {
-              console.warn(`[Liquidation] Canton USDC custodian transfer error:`, err);
-            }
-
-            ccSeized.push({
-              symbol: 'USDC',
-              amount: plan.seizeNum,
-              valueUSD: plan.seizeUSD,
+            const withdrawRes = await fetch('/api/custodian/withdraw-usdc', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ receiverParty: pos.broker, amount: plan.seizeNum }),
             });
-
-            cantonSettlement.push({
-              symbol: 'USDC',
-              amount: plan.seizeNum,
-              valueUSD: plan.seizeUSD,
-              source: 'direct',
-            });
-
-            // Re-deposit remainder if partial
-            if (isPartial) {
-              const remainder = plan.balanceNum! - plan.seizeNum;
-              const remainderValueUSD = remainder * plan.price;
-              try {
-                const newAssetId = `USDC-liq-remainder-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-                const issuanceResult = await sdk.cantonCreate({
-                  templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
-                  payload: {
-                    issuer: owner, recipient: owner,
-                    assetId: newAssetId, assetType: mapAssetTypeToEnum('USDC'),
-                    amount: toDecimal10(remainder),
-                    valueUSD: toDecimal10(remainderValueUSD),
-                  },
-                });
-                const acceptResult = await sdk.cantonExercise({
-                  contractId: issuanceResult.contractId,
-                  templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
-                  choice: 'Accept',
-                  argument: {},
-                });
-                const tokenCid = acceptResult.events?.find(
-                  (e: { templateId: string }) => e.templateId.includes('TokenizedAsset')
-                )?.contractId;
-                if (tokenCid) {
-                  const reVaults = await sdk.cantonQuery({
-                    templateId: TEMPLATE_IDS.VAULT,
-                    filter: { vaultId: pos.vaultId },
-                  });
-                  if (reVaults.length > 0) {
-                    await sdk.cantonExercise({
-                      contractId: reVaults[0].contractId,
-                      templateId: TEMPLATE_IDS.VAULT,
-                      choice: CHOICES.DEPOSIT_ASSET,
-                      argument: { assetCid: tokenCid },
-                    });
-                    console.log(`[Liquidation] Canton USDC remainder re-deposited: ${remainder.toFixed(4)}`);
-                  }
-                }
-              } catch (err) {
-                console.warn('[Liquidation] Canton USDC remainder re-deposit failed:', err);
-              }
+            const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
+            if (!withdrawRes.ok || !withdrawData.success) {
+              console.warn(`[Liquidation] Canton USDC transfer to broker failed:`, withdrawData.error);
+            } else {
+              console.log(`[Liquidation] Canton USDC transferred to broker: ${plan.seizeNum} USDC`);
             }
           } catch (err) {
-            console.warn('[Liquidation] Canton USDC seizure failed:', err);
+            console.warn(`[Liquidation] Canton USDC custodian transfer error:`, err);
           }
+
+          ccSeized.push({ symbol: 'USDC', amount: plan.seizeNum, valueUSD: plan.seizeUSD });
+          cantonSettlement.push({ symbol: 'USDC', amount: plan.seizeNum, valueUSD: plan.seizeUSD, source: 'direct' });
 
         } else if ((plan.type === 'CC' || plan.type === 'CUSDC') && plan.seizeNum && plan.seizeNum > 0) {
-          const isPartial = plan.seizeNum < plan.balanceNum!;
+          // CC/CUSDC: record seizure, vault depletion handled by SeizeCollateral below
           try {
-            // Re-query vault (WithdrawAsset archives + recreates)
-            const freshVaults = await sdk.cantonQuery({
-              templateId: TEMPLATE_IDS.VAULT,
-              filter: { vaultId: pos.vaultId }
+            const withdrawRes = await fetch('/api/custodian/withdraw', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ receiverParty: pos.broker, amount: plan.seizeNum }),
             });
-            if (freshVaults.length === 0) continue;
-
-            // Withdraw full entry from Daml vault (all-or-nothing per assetId)
-            await sdk.cantonExercise({
-              contractId: freshVaults[0].contractId,
-              templateId: TEMPLATE_IDS.VAULT,
-              choice: CHOICES.WITHDRAW_ASSET,
-              argument: { assetId: plan.assetId!, issuer: owner }
-            });
-            console.log(`[Liquidation] ${plan.type} withdrawn from vault: ${plan.balanceNum} ${plan.type} (seizing ${plan.seizeNum.toFixed(4)})`);
-
-            // Transfer seized portion to broker via custodian
-            try {
-              const withdrawRes = await fetch('/api/custodian/withdraw', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ receiverParty: pos.broker, amount: plan.seizeNum }),
-              });
-              const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
-              if (!withdrawRes.ok || !withdrawData.success) {
-                console.warn(`[Liquidation] ${plan.type} transfer to broker failed:`, withdrawData.error);
-              } else {
-                console.log(`[Liquidation] ${plan.type} transferred to broker: ${plan.seizeNum} ${plan.type}`);
-              }
-            } catch (err) {
-              console.warn(`[Liquidation] ${plan.type} custodian transfer error:`, err);
-            }
-
-            ccSeized.push({
-              symbol: plan.type,
-              amount: plan.seizeNum,
-              valueUSD: plan.seizeUSD,
-            });
-
-            cantonSettlement.push({
-              symbol: plan.type,
-              amount: plan.seizeNum,
-              valueUSD: plan.seizeUSD,
-              source: 'direct',
-            });
-
-            // Re-deposit remainder back into vault if partial seizure
-            if (isPartial) {
-              const remainder = plan.balanceNum! - plan.seizeNum;
-              const remainderValueUSD = remainder * plan.price;
-              try {
-                const newAssetId = `${plan.type}-liq-remainder-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-                const issuanceResult = await sdk.cantonCreate({
-                  templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
-                  payload: {
-                    issuer: owner, recipient: owner,
-                    assetId: newAssetId, assetType: mapAssetTypeToEnum(plan.type),
-                    amount: toDecimal10(remainder),
-                    valueUSD: toDecimal10(remainderValueUSD),
-                  },
-                });
-                const acceptResult = await sdk.cantonExercise({
-                  contractId: issuanceResult.contractId,
-                  templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
-                  choice: 'Accept',
-                  argument: {},
-                });
-                const tokenCid = acceptResult.events?.find(
-                  (e: { templateId: string }) => e.templateId.includes('TokenizedAsset')
-                )?.contractId;
-                if (tokenCid) {
-                  const reVaults = await sdk.cantonQuery({
-                    templateId: TEMPLATE_IDS.VAULT,
-                    filter: { vaultId: pos.vaultId },
-                  });
-                  if (reVaults.length > 0) {
-                    await sdk.cantonExercise({
-                      contractId: reVaults[0].contractId,
-                      templateId: TEMPLATE_IDS.VAULT,
-                      choice: CHOICES.DEPOSIT_ASSET,
-                      argument: { assetCid: tokenCid },
-                    });
-                    console.log(`[Liquidation] ${plan.type} remainder re-deposited: ${remainder.toFixed(4)} ${plan.type}`);
-                  }
-                }
-              } catch (err) {
-                console.warn(`[Liquidation] ${plan.type} remainder re-deposit failed:`, err);
-              }
+            const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
+            if (!withdrawRes.ok || !withdrawData.success) {
+              console.warn(`[Liquidation] ${plan.type} transfer to broker failed:`, withdrawData.error);
+            } else {
+              console.log(`[Liquidation] ${plan.type} transferred to broker: ${plan.seizeNum} ${plan.type}`);
             }
           } catch (err) {
-            console.warn(`[Liquidation] ${plan.type} seizure failed for ${plan.assetId}:`, err);
+            console.warn(`[Liquidation] ${plan.type} custodian transfer error:`, err);
           }
+
+          ccSeized.push({ symbol: plan.type, amount: plan.seizeNum, valueUSD: plan.seizeUSD });
+          cantonSettlement.push({ symbol: plan.type, amount: plan.seizeNum, valueUSD: plan.seizeUSD, source: 'direct' });
         }
       }
 
@@ -3337,25 +3188,29 @@ export const positionAPI = {
         escrowLiquidations.push(record);
       }
 
-      // Exercise SeizeCollateral for EVM-seized assets (vault Daml record still shows them)
-      // Canton assets are handled by WithdrawAsset + re-deposit above, but EVM assets
-      // only get seized on-chain — the vault's collateralAssets is not updated.
-      const evmSeizedAssets: Array<{ assetId: string; amount: number; valueUSD: number }> = [];
+      // Exercise SeizeCollateral (operator-controlled) to deplete vault ledger for ALL seized assets.
+      // WithdrawAsset requires controller=owner (fund) which the broker can't exercise.
+      // SeizeCollateral requires controller=operator which is available via actAs.
+      const seizedVaultAssets: Array<{ assetId: string; amount: number; valueUSD: number }> = [];
       for (const plan of seizurePlan) {
-        if ((plan.type === 'USDC' || plan.type === 'ETH') && plan.seizeUSD > 0 && !plan.assetId) {
-          // Map EVM type back to vault collateralAssets entry
+        if (plan.seizeUSD <= 0) continue;
+        if (plan.assetId) {
+          // Canton-native: CC, CUSDC, USDC_CANTON — assetId comes directly from inventory
+          seizedVaultAssets.push({ assetId: plan.assetId, amount: plan.seizeNum || 0, valueUSD: plan.seizeUSD });
+        } else if (plan.type === 'USDC' || plan.type === 'ETH') {
+          // EVM assets: map type back to vault collateralAssets entry by symbol prefix
           const symbol = plan.type;
           const vaultEntry = vault.collateralAssets.find(a => a.assetId.split('-')[0].toUpperCase() === symbol);
           if (vaultEntry) {
             const seizedAmount = plan.type === 'USDC'
               ? Number(plan.seizeWei || 0n) / 1e6
               : Number(plan.seizeWei || 0n) / 1e18;
-            evmSeizedAssets.push({ assetId: vaultEntry.assetId, amount: seizedAmount, valueUSD: plan.seizeUSD });
+            seizedVaultAssets.push({ assetId: vaultEntry.assetId, amount: seizedAmount, valueUSD: plan.seizeUSD });
           }
         }
       }
 
-      if (evmSeizedAssets.length > 0) {
+      if (seizedVaultAssets.length > 0) {
         try {
           const seizeOperator = await getOperatorParty();
           const seizeActAs = seizeOperator ? [seizeOperator] : [];
@@ -3366,7 +3221,7 @@ export const positionAPI = {
           let vaultCid = freshVaults[0]?.contractId;
 
           if (vaultCid) {
-            for (const seized of evmSeizedAssets) {
+            for (const seized of seizedVaultAssets) {
               try {
                 const seizeResult = await sdk.cantonExercise({
                   contractId: vaultCid,
