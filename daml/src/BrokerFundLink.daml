@@ -28,6 +28,7 @@ template BrokerFundInvitation
           linkedAt = createdAt
           allowedAssets = Some ["BTC", "ETH", "SOL", "CC", "USDC", "USDT", "TRX", "TON", "CUSD"]
           allowedCollaterals = Some ["BTC", "ETH", "SOL", "CC", "USDC", "USDT", "TRX", "TON", "CUSD"]
+          leverageRatio = Some 1.0
 
     choice RejectInvitation: ()
       controller fund
@@ -45,6 +46,7 @@ template BrokerFundLink
     linkedAt: Text
     allowedAssets: Optional [Text]
     allowedCollaterals: Optional [Text]
+    leverageRatio: Optional Decimal
   where
     signatory broker, fund, operator
 
@@ -54,6 +56,13 @@ template BrokerFundLink
       controller broker
       do
         create this with ltvThreshold = newThreshold
+
+    choice SetLeverageRatio: ContractId BrokerFundLink
+      with
+        newLeverageRatio: Decimal
+      controller broker
+      do
+        create this with leverageRatio = Some newLeverageRatio
 
     choice DeactivateLink: ContractId BrokerFundLink
       controller broker
@@ -82,6 +91,7 @@ template BrokerFundLink
     nonconsuming choice ProposeLTVChange: ContractId LTVChangeProposal
       with
         proposedThreshold: Decimal
+        proposedLeverage: Optional Decimal
         proposalId: Text
         proposalCreatedAt: Text
       controller broker
@@ -92,7 +102,9 @@ template BrokerFundLink
           operator
           linkContractId = self
           proposedThreshold
+          proposedLeverage
           currentThreshold = ltvThreshold
+          currentLeverage = leverageRatio
           proposalId
           createdAt = proposalCreatedAt
 
@@ -103,7 +115,9 @@ template LTVChangeProposal
     operator: Party
     linkContractId: ContractId BrokerFundLink
     proposedThreshold: Decimal
+    proposedLeverage: Optional Decimal
     currentThreshold: Decimal
+    currentLeverage: Optional Decimal
     proposalId: Text
     createdAt: Text
   where
@@ -113,7 +127,10 @@ template LTVChangeProposal
     choice AcceptProposal: ContractId BrokerFundLink
       controller fund
       do
-        exercise linkContractId SetLTVThreshold with newThreshold = proposedThreshold
+        newLink <- exercise linkContractId SetLTVThreshold with newThreshold = proposedThreshold
+        case proposedLeverage of
+          None -> return newLink
+          Some lev -> exercise newLink SetLeverageRatio with newLeverageRatio = lev
 
     choice RejectProposal: ()
       controller fund

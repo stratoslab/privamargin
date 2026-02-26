@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { HashRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { Box, Typography, List, ListItem, ListItemIcon, ListItemText, ListItemButton, Button, TextField, Select, MenuItem, FormControl, InputLabel, Chip } from '@mui/material';
+import { Box, Typography, List, ListItem, ListItemIcon, ListItemText, ListItemButton, Button, TextField, Select, MenuItem, FormControl, InputLabel, Chip, Tooltip, IconButton } from '@mui/material';
 import {
   Dashboard as DashboardIcon,
   AccountBalance,
@@ -14,7 +14,10 @@ import {
   Handshake,
   People,
   Add,
-  Close
+  Close,
+  ChevronLeft,
+  ChevronRight,
+  Menu as MenuIcon,
 } from '@mui/icons-material';
 import { getSDK, type AuthUser, type Asset } from '@stratos-wallet/sdk';
 import { RoleProvider, useRole } from './context/RoleContext';
@@ -43,7 +46,7 @@ const bottomMenuItems = [
 ];
 
 
-function Sidebar() {
+function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
   const location = useLocation();
   const { role, isOperator } = useRole();
 
@@ -53,12 +56,14 @@ function Sidebar() {
   // Only operator gets the admin link (brokers manage funds via Client Accounts)
   const showAdmin = isOperator;
 
+  const sidebarWidth = collapsed ? 64 : 240;
+
   return (
     <Box
       component="nav"
       sx={{
-        width: 240,
-        minWidth: 240,
+        width: sidebarWidth,
+        minWidth: sidebarWidth,
         height: '100vh',
         bgcolor: '#0d1117',
         borderRight: '1px solid rgba(255,255,255,0.06)',
@@ -68,14 +73,17 @@ function Sidebar() {
         left: 0,
         top: 0,
         zIndex: 1000,
+        transition: 'width 0.2s ease, min-width 0.2s ease',
+        overflow: 'hidden',
       }}
     >
       {/* Logo */}
-      <Box sx={{ p: 2.5, display: 'flex', alignItems: 'center', gap: 1.5 }}>
+      <Box sx={{ p: collapsed ? 2 : 2.5, display: 'flex', alignItems: 'center', gap: 1.5, justifyContent: collapsed ? 'center' : 'flex-start' }}>
         <Box
           sx={{
             width: 32,
             height: 32,
+            minWidth: 32,
             borderRadius: '8px',
             border: '2px solid #00d4aa',
             display: 'flex',
@@ -85,22 +93,24 @@ function Sidebar() {
         >
           <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: '#00d4aa' }} />
         </Box>
-        <Box>
-          <Typography sx={{ fontWeight: 600, fontSize: 16, color: 'white', letterSpacing: '-0.3px', fontFamily: '"Outfit", sans-serif' }}>
-            Priva<span style={{ color: '#00d4aa' }}>Margin</span>
-          </Typography>
-          <Typography sx={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: '1px', textTransform: 'uppercase', fontFamily: '"Outfit", sans-serif' }}>
-            Private Collateral Vault
-          </Typography>
-        </Box>
+        {!collapsed && (
+          <Box>
+            <Typography sx={{ fontWeight: 600, fontSize: 16, color: 'white', letterSpacing: '-0.3px', fontFamily: '"Outfit", sans-serif', whiteSpace: 'nowrap' }}>
+              Priva<span style={{ color: '#00d4aa' }}>Margin</span>
+            </Typography>
+            <Typography sx={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: '1px', textTransform: 'uppercase', fontFamily: '"Outfit", sans-serif', whiteSpace: 'nowrap' }}>
+              Private Collateral Vault
+            </Typography>
+          </Box>
+        )}
       </Box>
 
       {/* Main Navigation */}
       <List sx={{ flex: 1, pt: 2 }}>
         {menuItems.map((item) => {
           const isActive = location.pathname === item.path;
-          return (
-            <ListItem key={item.path} disablePadding sx={{ px: 1.5, mb: 0.5 }}>
+          const button = (
+            <ListItem key={item.path} disablePadding sx={{ px: collapsed ? 1 : 1.5, mb: 0.5 }}>
               <ListItemButton
                 component={Link}
                 to={item.path}
@@ -109,91 +119,148 @@ function Sidebar() {
                   bgcolor: isActive ? 'rgba(0, 212, 170, 0.1)' : 'transparent',
                   '&:hover': { bgcolor: 'rgba(255,255,255,0.05)' },
                   py: 1.2,
+                  justifyContent: collapsed ? 'center' : 'flex-start',
+                  px: collapsed ? 0 : 2,
                 }}
               >
-                <ListItemIcon sx={{ minWidth: 36 }}>
+                <ListItemIcon sx={{ minWidth: collapsed ? 0 : 36, justifyContent: 'center' }}>
                   <item.icon sx={{ color: isActive ? '#00d4aa' : 'rgba(255,255,255,0.5)', fontSize: 20 }} />
                 </ListItemIcon>
-                <ListItemText
-                  primary={item.label}
-                  primaryTypographyProps={{
-                    sx: {
-                      fontSize: 14,
-                      fontWeight: isActive ? 500 : 400,
-                      color: isActive ? '#00d4aa' : 'rgba(255,255,255,0.7)',
-                      fontFamily: '"Outfit", sans-serif',
-                    },
-                  }}
-                />
+                {!collapsed && (
+                  <ListItemText
+                    primary={item.label}
+                    primaryTypographyProps={{
+                      sx: {
+                        fontSize: 14,
+                        fontWeight: isActive ? 500 : 400,
+                        color: isActive ? '#00d4aa' : 'rgba(255,255,255,0.7)',
+                        fontFamily: '"Outfit", sans-serif',
+                        whiteSpace: 'nowrap',
+                      },
+                    }}
+                  />
+                )}
               </ListItemButton>
             </ListItem>
+          );
+          return collapsed ? (
+            <Tooltip key={item.path} title={item.label} placement="right" arrow>
+              {button}
+            </Tooltip>
+          ) : (
+            button
           );
         })}
       </List>
 
       {/* Admin link for operator / broker */}
       {showAdmin && (
-        <List sx={{ px: 1.5 }}>
-          <ListItem disablePadding sx={{ mb: 0.5 }}>
-            <ListItemButton
-              component={Link}
-              to="/admin"
-              sx={{
-                borderRadius: '8px',
-                bgcolor: location.pathname === '/admin' ? 'rgba(245, 158, 11, 0.1)' : 'transparent',
-                '&:hover': { bgcolor: 'rgba(255,255,255,0.05)' },
-                py: 1.2,
-              }}
-            >
-              <ListItemIcon sx={{ minWidth: 36 }}>
-                <AdminPanelSettings sx={{ color: location.pathname === '/admin' ? '#f59e0b' : 'rgba(255,255,255,0.5)', fontSize: 20 }} />
-              </ListItemIcon>
-              <ListItemText
-                primary="Manage Roles"
-                primaryTypographyProps={{
-                  sx: {
-                    fontSize: 14,
-                    fontWeight: location.pathname === '/admin' ? 500 : 400,
-                    color: location.pathname === '/admin' ? '#f59e0b' : 'rgba(255,255,255,0.7)',
-                    fontFamily: '"Outfit", sans-serif',
-                  },
-                }}
-              />
-            </ListItemButton>
-          </ListItem>
+        <List sx={{ px: collapsed ? 1 : 1.5 }}>
+          {(() => {
+            const adminButton = (
+              <ListItem disablePadding sx={{ mb: 0.5 }}>
+                <ListItemButton
+                  component={Link}
+                  to="/admin"
+                  sx={{
+                    borderRadius: '8px',
+                    bgcolor: location.pathname === '/admin' ? 'rgba(245, 158, 11, 0.1)' : 'transparent',
+                    '&:hover': { bgcolor: 'rgba(255,255,255,0.05)' },
+                    py: 1.2,
+                    justifyContent: collapsed ? 'center' : 'flex-start',
+                    px: collapsed ? 0 : 2,
+                  }}
+                >
+                  <ListItemIcon sx={{ minWidth: collapsed ? 0 : 36, justifyContent: 'center' }}>
+                    <AdminPanelSettings sx={{ color: location.pathname === '/admin' ? '#f59e0b' : 'rgba(255,255,255,0.5)', fontSize: 20 }} />
+                  </ListItemIcon>
+                  {!collapsed && (
+                    <ListItemText
+                      primary="Manage Roles"
+                      primaryTypographyProps={{
+                        sx: {
+                          fontSize: 14,
+                          fontWeight: location.pathname === '/admin' ? 500 : 400,
+                          color: location.pathname === '/admin' ? '#f59e0b' : 'rgba(255,255,255,0.7)',
+                          fontFamily: '"Outfit", sans-serif',
+                          whiteSpace: 'nowrap',
+                        },
+                      }}
+                    />
+                  )}
+                </ListItemButton>
+              </ListItem>
+            );
+            return collapsed ? (
+              <Tooltip title="Manage Roles" placement="right" arrow>
+                {adminButton}
+              </Tooltip>
+            ) : (
+              adminButton
+            );
+          })()}
         </List>
       )}
 
       {/* Bottom Navigation */}
-      <List sx={{ pb: 2 }}>
-        {bottomMenuItems.map((item) => (
-          <ListItem key={item.path} disablePadding sx={{ px: 1.5, mb: 0.5 }}>
-            <ListItemButton
-              component={Link}
-              to={item.path}
-              sx={{
-                borderRadius: '8px',
-                '&:hover': { bgcolor: 'rgba(255,255,255,0.05)' },
-                py: 1,
-              }}
-            >
-              <ListItemIcon sx={{ minWidth: 36 }}>
-                <item.icon sx={{ color: 'rgba(255,255,255,0.4)', fontSize: 18 }} />
-              </ListItemIcon>
-              <ListItemText
-                primary={item.label}
-                primaryTypographyProps={{
-                  sx: {
-                    fontSize: 13,
-                    color: 'rgba(255,255,255,0.5)',
-                    fontFamily: '"Outfit", sans-serif',
-                  },
+      <List sx={{ pb: 1 }}>
+        {bottomMenuItems.map((item) => {
+          const bottomButton = (
+            <ListItem key={item.path} disablePadding sx={{ px: collapsed ? 1 : 1.5, mb: 0.5 }}>
+              <ListItemButton
+                component={Link}
+                to={item.path}
+                sx={{
+                  borderRadius: '8px',
+                  '&:hover': { bgcolor: 'rgba(255,255,255,0.05)' },
+                  py: 1,
+                  justifyContent: collapsed ? 'center' : 'flex-start',
+                  px: collapsed ? 0 : 2,
                 }}
-              />
-            </ListItemButton>
-          </ListItem>
-        ))}
+              >
+                <ListItemIcon sx={{ minWidth: collapsed ? 0 : 36, justifyContent: 'center' }}>
+                  <item.icon sx={{ color: 'rgba(255,255,255,0.4)', fontSize: 18 }} />
+                </ListItemIcon>
+                {!collapsed && (
+                  <ListItemText
+                    primary={item.label}
+                    primaryTypographyProps={{
+                      sx: {
+                        fontSize: 13,
+                        color: 'rgba(255,255,255,0.5)',
+                        fontFamily: '"Outfit", sans-serif',
+                        whiteSpace: 'nowrap',
+                      },
+                    }}
+                  />
+                )}
+              </ListItemButton>
+            </ListItem>
+          );
+          return collapsed ? (
+            <Tooltip key={item.path} title={item.label} placement="right" arrow>
+              {bottomButton}
+            </Tooltip>
+          ) : (
+            bottomButton
+          );
+        })}
       </List>
+
+      {/* Collapse toggle button */}
+      <Box sx={{ p: 1, borderTop: '1px solid rgba(255,255,255,0.06)', display: 'flex', justifyContent: 'center' }}>
+        <Tooltip title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'} placement="right" arrow>
+          <IconButton
+            onClick={onToggle}
+            sx={{
+              color: 'rgba(255,255,255,0.4)',
+              '&:hover': { color: 'rgba(255,255,255,0.7)', bgcolor: 'rgba(255,255,255,0.05)' },
+            }}
+          >
+            {collapsed ? <ChevronRight sx={{ fontSize: 20 }} /> : <ChevronLeft sx={{ fontSize: 20 }} />}
+          </IconButton>
+        </Tooltip>
+      </Box>
     </Box>
   );
 }
@@ -222,7 +289,7 @@ function RoleBadge() {
   );
 }
 
-function Header({ user }: { user: AuthUser | null }) {
+function Header({ user, collapsed, onToggle }: { user: AuthUser | null; collapsed: boolean; onToggle: () => void }) {
   return (
     <Box
       component="header"
@@ -235,6 +302,20 @@ function Header({ user }: { user: AuthUser | null }) {
         borderBottom: '1px solid rgba(255,255,255,0.06)',
       }}
     >
+      {collapsed && (
+        <Tooltip title="Expand sidebar" arrow>
+          <IconButton
+            onClick={onToggle}
+            sx={{
+              mr: 'auto',
+              color: 'rgba(255,255,255,0.5)',
+              '&:hover': { color: 'rgba(255,255,255,0.8)', bgcolor: 'rgba(255,255,255,0.05)' },
+            }}
+          >
+            <MenuIcon sx={{ fontSize: 22 }} />
+          </IconButton>
+        </Tooltip>
+      )}
       <RoleBadge />
       <Box
         sx={{
@@ -270,20 +351,39 @@ function Header({ user }: { user: AuthUser | null }) {
 
 // Top Navigation Header for non-dashboard pages
 function SidebarLayout({ children, user }: { children: React.ReactNode; user: AuthUser | null }) {
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem('sidebar-collapsed') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const handleToggleSidebar = () => {
+    setSidebarCollapsed(prev => {
+      const next = !prev;
+      try { localStorage.setItem('sidebar-collapsed', String(next)); } catch {}
+      return next;
+    });
+  };
+
+  const sidebarWidth = sidebarCollapsed ? 64 : 240;
+
   return (
     <Box sx={{ display: 'flex', minHeight: '100vh', bgcolor: '#0a0e14' }}>
-      <Sidebar />
+      <Sidebar collapsed={sidebarCollapsed} onToggle={handleToggleSidebar} />
       <Box
         component="main"
         sx={{
           flex: 1,
-          marginLeft: '240px',
+          marginLeft: `${sidebarWidth}px`,
           display: 'flex',
           flexDirection: 'column',
           minHeight: '100vh',
+          transition: 'margin-left 0.2s ease',
         }}
       >
-        <Header user={user} />
+        <Header user={user} collapsed={sidebarCollapsed} onToggle={handleToggleSidebar} />
         <Box sx={{ flex: 1, p: 3 }}>
           {children}
         </Box>

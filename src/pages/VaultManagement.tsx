@@ -170,10 +170,14 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
       setWithdrawSuccess('');
 
       if (withdrawChain === 'Canton') {
-        // CC withdrawal: exercise WithdrawAsset on the vault (returns CC to owner)
+        // CC withdrawal: transfers from custodian first, then removes Daml entries
         const amount = parseFloat(withdrawAmount);
-        await vaultAPI.withdrawCantonAsset(withdrawVaultId, withdrawAssetSymbol, amount);
-        setWithdrawSuccess(`Withdrew ${withdrawAmount} ${displaySymbol(withdrawAssetSymbol)} from vault`);
+        const cantonResult = await vaultAPI.withdrawCantonAsset(withdrawVaultId, withdrawAssetSymbol, amount, user.username);
+        if (cantonResult.damlErrors) {
+          setWithdrawSuccess(`Withdrew ${withdrawAmount} ${displaySymbol(withdrawAssetSymbol)} — vault display may take a moment to update`);
+        } else {
+          setWithdrawSuccess(`Withdrew ${withdrawAmount} ${displaySymbol(withdrawAssetSymbol)} from vault`);
+        }
       } else {
         // EVM withdrawal: withdraw from escrow contract
         const isStablecoin = ['USDC', 'USDT'].includes(withdrawAssetSymbol);
@@ -187,7 +191,12 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
           : undefined;
 
         const result = await vaultAPI.withdrawFromEscrow(withdrawVaultId, withdrawChain, amountSmallest, tokenAddress, withdrawAssetSymbol);
-        setWithdrawSuccess(`Withdrawal sent (tx: ${result.data.txHash.slice(0, 20)}...)`);
+        if (result.data.damlCleanupErrors) {
+          console.warn('EVM withdrawal succeeded but vault record cleanup had errors:', result.data.damlCleanupErrors);
+          setWithdrawSuccess(`Withdrawal sent (tx: ${result.data.txHash.slice(0, 20)}...) — vault balance will update on next sync`);
+        } else {
+          setWithdrawSuccess(`Withdrawal sent (tx: ${result.data.txHash.slice(0, 20)}...)`);
+        }
       }
 
       setTimeout(() => {
@@ -224,7 +233,7 @@ export default function VaultManagement({ user, assets }: VaultManagementProps) 
         }
         try {
           setCloseStatus(`Returning ${asset.amount} ${displaySymbol(asset.assetType)} to wallet...`);
-          await vaultAPI.withdrawCantonAsset(vaultId, asset.assetType, asset.amount);
+          await vaultAPI.withdrawCantonAsset(vaultId, asset.assetType, asset.amount, user.username);
         } catch (err) {
           console.warn(`${asset.assetType} withdraw failed (may already be returned):`, err);
         }

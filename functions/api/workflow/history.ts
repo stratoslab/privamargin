@@ -4,7 +4,7 @@ interface Env {
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
   'Content-Type': 'application/json',
 };
@@ -61,6 +61,44 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
   } catch (err) {
     return new Response(
       JSON.stringify({ error: 'Failed to fetch workflow history' }),
+      { status: 500, headers: CORS_HEADERS }
+    );
+  }
+};
+
+export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
+  try {
+    const record = await request.json() as { timestamp?: string; [key: string]: unknown };
+    if (!record.timestamp) {
+      return new Response(
+        JSON.stringify({ error: 'Missing timestamp' }),
+        { status: 400, headers: CORS_HEADERS }
+      );
+    }
+
+    const ts = record.timestamp as string;
+
+    // Write run record (30-day TTL)
+    await env.PRIVAMARGIN_CONFIG.put(
+      `workflow:run:${ts}`,
+      JSON.stringify(record),
+      { expirationTtl: 30 * 24 * 60 * 60 }
+    );
+
+    // Update rolling index
+    const indexRaw = await env.PRIVAMARGIN_CONFIG.get('workflow:runs:index');
+    const index: string[] = indexRaw ? JSON.parse(indexRaw) : [];
+    index.push(ts);
+    if (index.length > 100) index.splice(0, index.length - 100);
+    await env.PRIVAMARGIN_CONFIG.put('workflow:runs:index', JSON.stringify(index));
+
+    return new Response(
+      JSON.stringify({ success: true }),
+      { status: 200, headers: CORS_HEADERS }
+    );
+  } catch (err) {
+    return new Response(
+      JSON.stringify({ error: 'Failed to persist run record' }),
       { status: 500, headers: CORS_HEADERS }
     );
   }

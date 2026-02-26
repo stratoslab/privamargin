@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
 import {
   Box, Typography, Button, TextField, Chip, Grid, Slider,
-  Dialog, DialogTitle, DialogContent, DialogActions
+  Dialog, DialogTitle, DialogContent, DialogActions,
+  Switch, FormControlLabel
 } from '@mui/material';
-import { Send, People, Edit, Security } from '@mui/icons-material';
+import { Send, People, Edit, Security, Bolt } from '@mui/icons-material';
 import { invitationAPI, linkAPI, proposalAPI, assetAPI } from '../services/api';
 import type { Invitation, BrokerFundLinkData, LTVChangeProposalData } from '../services/api';
 import { useRole } from '../context/RoleContext';
@@ -22,11 +23,13 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
   const [sending, setSending] = useState(false);
   const [editingLink, setEditingLink] = useState<BrokerFundLinkData | null>(null);
   const [newThreshold, setNewThreshold] = useState(80);
+  const [newLeverage, setNewLeverage] = useState(1);
   const [editingAssets, setEditingAssets] = useState<BrokerFundLinkData | null>(null);
   const [selectedAssets, setSelectedAssets] = useState<string[]>([]);
   const [editingCollaterals, setEditingCollaterals] = useState<BrokerFundLinkData | null>(null);
   const [selectedCollaterals, setSelectedCollaterals] = useState<string[]>([]);
   const [allAssetTypes, setAllAssetTypes] = useState<string[]>([]);
+  const [autoLiqPrefs, setAutoLiqPrefs] = useState<Record<string, boolean>>({});
   const { allRoles, assignRole } = useRole();
 
   const partyId = user.partyId || user.id;
@@ -45,14 +48,16 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
 
   const loadData = async () => {
     try {
-      const [invRes, linkRes, propRes] = await Promise.all([
+      const [invRes, linkRes, propRes, alPrefs] = await Promise.all([
         invitationAPI.listSentByBroker(partyId),
         linkAPI.getLinksForBroker(partyId),
         proposalAPI.listForBroker(partyId),
+        linkAPI.getAutoLiquidatePrefs(partyId),
       ]);
       setInvitations(invRes.data);
       setLinks(linkRes.data);
       setProposals(propRes.data);
+      setAutoLiqPrefs(alPrefs);
     } catch (error) {
       console.error('Error loading fund links:', error);
     }
@@ -80,7 +85,8 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
   const handleUpdateThreshold = async () => {
     if (!editingLink) return;
     try {
-      await proposalAPI.propose(editingLink.contractId, newThreshold / 100, editingLink.ltvThreshold);
+      const proposedLev = newLeverage !== editingLink.leverageRatio ? newLeverage : undefined;
+      await proposalAPI.propose(editingLink.contractId, newThreshold / 100, editingLink.ltvThreshold, proposedLev);
       setEditingLink(null);
       await loadData();
     } catch (error) {
@@ -293,11 +299,26 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
                   </Box>
 
                   <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <Box>
-                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', mb: 0.3 }}>LTV Threshold</Typography>
-                      <Typography sx={{ fontSize: 20, fontWeight: 600, color: '#f59e0b' }}>
-                        {(link.ltvThreshold * 100).toFixed(0)}%
-                      </Typography>
+                    <Box sx={{ display: 'flex', gap: 3 }}>
+                      <Box>
+                        <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', mb: 0.3 }}>LTV Threshold</Typography>
+                        <Typography sx={{ fontSize: 20, fontWeight: 600, color: '#f59e0b' }}>
+                          {(link.ltvThreshold * 100).toFixed(0)}%
+                        </Typography>
+                      </Box>
+                      <Box>
+                        <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', mb: 0.3 }}>Leverage</Typography>
+                        <Chip
+                          label={`${link.leverageRatio}x`}
+                          size="small"
+                          sx={{
+                            bgcolor: link.leverageRatio > 1 ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.08)',
+                            color: link.leverageRatio > 1 ? '#3b82f6' : 'rgba(255,255,255,0.5)',
+                            fontWeight: 700,
+                            fontSize: 14,
+                          }}
+                        />
+                      </Box>
                     </Box>
                     <Button
                       variant="outlined"
@@ -307,6 +328,7 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
                       onClick={() => {
                         setEditingLink(link);
                         setNewThreshold(link.ltvThreshold * 100);
+                        setNewLeverage(link.leverageRatio);
                       }}
                       sx={{
                         borderColor: 'rgba(139,92,246,0.5)',
@@ -319,6 +341,47 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
                       Propose Change
                     </Button>
                   </Box>
+
+                  {/* Auto-Liquidate Toggle */}
+                  <Box sx={{ mt: 1.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <Bolt sx={{ fontSize: 16, color: '#8b5cf6' }} />
+                      <FormControlLabel
+                        control={
+                          <Switch
+                            checked={autoLiqPrefs[link.fund] ?? false}
+                            onChange={async (e) => {
+                              const newVal = e.target.checked;
+                              // Optimistic update — KV reads may lag behind writes
+                              setAutoLiqPrefs(prev => ({ ...prev, [link.fund]: newVal }));
+                              try {
+                                await linkAPI.setAutoLiquidate(partyId, link.fund, newVal);
+                              } catch (error) {
+                                // Revert on failure
+                                setAutoLiqPrefs(prev => ({ ...prev, [link.fund]: !newVal }));
+                                console.error('Error toggling auto-liquidate:', error);
+                              }
+                            }}
+                            sx={{
+                              '& .MuiSwitch-switchBase.Mui-checked': { color: '#8b5cf6' },
+                              '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { bgcolor: '#8b5cf6' },
+                            }}
+                          />
+                        }
+                        label={
+                          <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.6)' }}>
+                            Auto-Liquidate
+                          </Typography>
+                        }
+                        sx={{ m: 0 }}
+                      />
+                    </Box>
+                  </Box>
+                  {(autoLiqPrefs[link.fund] ?? false) && (
+                    <Typography sx={{ fontSize: 11, color: 'rgba(139,92,246,0.7)', mt: 0.5 }}>
+                      Positions will be automatically liquidated when LTV exceeds threshold
+                    </Typography>
+                  )}
 
                   {/* Tradeable Assets */}
                   <Box sx={{ mt: 1.5, mb: 1 }}>
@@ -398,7 +461,9 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
 
                   {pending && (
                     <Typography sx={{ fontSize: 11, color: '#f59e0b', mt: 1 }}>
-                      Proposed: {(pending.proposedThreshold * 100).toFixed(0)}% (awaiting fund approval)
+                      Proposed: {(pending.proposedThreshold * 100).toFixed(0)}%
+                      {pending.proposedLeverage != null && ` / ${pending.proposedLeverage}x leverage`}
+                      {' '}(awaiting fund approval)
                     </Typography>
                   )}
 
@@ -446,6 +511,26 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
             ]}
             sx={{
               color: '#8b5cf6',
+              '& .MuiSlider-markLabel': { color: 'rgba(255,255,255,0.4)', fontSize: 12 },
+            }}
+          />
+          <Typography sx={{ fontSize: 14, color: 'white', mt: 3, mb: 1 }}>
+            Leverage Ratio: {newLeverage}x
+          </Typography>
+          <Slider
+            value={newLeverage}
+            onChange={(_, val) => setNewLeverage(val as number)}
+            min={1}
+            max={50}
+            step={1}
+            marks={[
+              { value: 1, label: '1x' },
+              { value: 10, label: '10x' },
+              { value: 25, label: '25x' },
+              { value: 50, label: '50x' },
+            ]}
+            sx={{
+              color: '#3b82f6',
               '& .MuiSlider-markLabel': { color: 'rgba(255,255,255,0.4)', fontSize: 12 },
             }}
           />

@@ -1,13 +1,37 @@
 /**
  * PrivaMargin LTV Monitor Workflow
  *
- * Cloudflare Workflow that runs every 15 minutes to:
- * 1. Fetch all open Position contracts
- * 2. Fetch vault values with live prices
- * 3. Recalculate LTVs
- * 4. Check against BrokerFundLink thresholds
- * 5. Create WorkflowMarginCall contracts for breaches
- * 6. Update Position LTVs on Canton
+ * Cloudflare Workflow that runs on a configurable interval (default 15 min) to:
+ *
+ * 1. Fetch all open/margin-called Position contracts from Canton
+ * 2. Fetch CollateralVault values and reprice with live market data (CoinGecko)
+ * 3. Compute per-position PnL and aggregate LTV per vault (leverage-aware)
+ * 4. Check LTV against BrokerFundLink thresholds; create WorkflowMarginCall
+ *    and optionally auto-liquidate (EVM seizure + Canton LiquidatePosition)
+ * 5. Update on-ledger LTV via UpdateLTV for all surviving positions
+ * 6. Generate SHA-256 collateral attestation per vault and exercise
+ *    OperatorAttestCollateral (controller operator) on all positions
+ * 7. Persist run record to KV for operator dashboard visibility
+ *
+ * ZK Proofs (dual-layer):
+ *   - Operator attestation: This workflow generates a SHA-256 hash of the
+ *     vault's collateral state each cycle and writes it on-ledger via
+ *     OperatorAttestCollateral. This ensures every position always has a
+ *     fresh attestation (purple shield).
+ *   - Fund Groth16 proof: When the fund loads the Positions page, their
+ *     browser can upgrade the attestation to a real Groth16 ZK proof via
+ *     snarkjs (see src/services/zkProof.ts) and AttestCollateral
+ *     (controller fund). This provides cryptographic privacy guarantees.
+ *
+ * Environment Variables:
+ *   CANTON_HOST           — Canton JSON API v1 host (e.g. p2-json.cantondefi.com)
+ *   CANTON_AUTH_TOKEN      — Bearer token for Canton JSON API
+ *   OPERATOR_PARTY         — Canton party ID of the operator
+ *   PACKAGE_ID             — Daml package ID for template resolution
+ *   PRIVAMARGIN_CONFIG     — KV namespace for config, run records, ZK proofs
+ *
+ * Secrets (set via `wrangler secret put`):
+ *   CANTON_AUTH_TOKEN, OPERATOR_PARTY, DEPLOYER_PRIVATE_KEY, CANTON_AUTH_SECRET
  */
 
 import {
@@ -82,6 +106,36 @@ interface LinkContract {
   };
 }
 
+// Generate a JWT for Canton JSON API (same approach as cloudflare-wallet)
+async function generateCantonToken(env: Env): Promise<string> {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const payload = {
+    sub: env.SPLICE_ADMIN_USER || 'app-user',
+    aud: env.CANTON_AUTH_AUDIENCE || 'https://canton.network.global',
+    exp: Math.floor(Date.now() / 1000) + 3600,
+  };
+  const encoder = new TextEncoder();
+  const b64url = (data: Uint8Array) => btoa(String.fromCharCode(...data))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const headerB64 = b64url(encoder.encode(JSON.stringify(header)));
+  const payloadB64 = b64url(encoder.encode(JSON.stringify(payload)));
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const key = await crypto.subtle.importKey(
+    'raw', encoder.encode(env.CANTON_AUTH_SECRET || 'unsafe'),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const signature = new Uint8Array(
+    await crypto.subtle.sign('HMAC', key, encoder.encode(signingInput))
+  );
+  return `${signingInput}.${b64url(signature)}`;
+}
+
+async function getCantonToken(env: Env): Promise<string> {
+  // Always self-generate JWT to match the current CANTON_HOST.
+  // Pre-set CANTON_AUTH_TOKEN may be stale or bound to a different host.
+  return generateCantonToken(env);
+}
+
 // Canton JSON API helpers
 async function cantonQuery(env: Env, templateId: string, filter?: Record<string, unknown>): Promise<any[]> {
   const body: any = {
@@ -91,19 +145,19 @@ async function cantonQuery(env: Env, templateId: string, filter?: Record<string,
     body.query = filter;
   }
 
+  const token = await getCantonToken(env);
   const response = await fetch(`https://${env.CANTON_HOST}/v1/query`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${env.CANTON_AUTH_TOKEN}`,
+      'Authorization': `Bearer ${token}`,
     },
     body: JSON.stringify(body),
   });
 
   if (!response.ok) {
     const text = await response.text();
-    console.error(`Canton query failed: ${response.status} ${text}`);
-    return [];
+    throw new Error(`Canton query failed: ${response.status} ${text}`);
   }
 
   const data = await response.json() as { result: any[] };
@@ -111,11 +165,12 @@ async function cantonQuery(env: Env, templateId: string, filter?: Record<string,
 }
 
 async function cantonCreate(env: Env, templateId: string, payload: Record<string, unknown>): Promise<any> {
+  const token = await getCantonToken(env);
   const response = await fetch(`https://${env.CANTON_HOST}/v1/create`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${env.CANTON_AUTH_TOKEN}`,
+      'Authorization': `Bearer ${token}`,
     },
     body: JSON.stringify({
       templateId,
@@ -132,11 +187,12 @@ async function cantonCreate(env: Env, templateId: string, payload: Record<string
 }
 
 async function cantonExercise(env: Env, contractId: string, templateId: string, choice: string, argument: Record<string, unknown>): Promise<any> {
+  const token = await getCantonToken(env);
   const response = await fetch(`https://${env.CANTON_HOST}/v1/exercise`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${env.CANTON_AUTH_TOKEN}`,
+      'Authorization': `Bearer ${token}`,
     },
     body: JSON.stringify({
       templateId,
@@ -592,6 +648,73 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
         });
       } catch (err) {
         console.error(`Failed to update LTV for ${result.positionId}:`, err);
+      }
+    }
+
+    // Step 7b: Operator SHA-256 collateral attestation per vault.
+    // For each vault, hash the collateral state and exercise OperatorAttestCollateral
+    // on all positions sharing that vault. This gives every position a ZK proof shield.
+    const attestedVaults = new Set<string>();
+    for (const result of ltvResults) {
+      if (liquidatedPositionIds.has(result.positionId)) continue;
+      if (attestedVaults.has(result.vaultId)) continue;
+      attestedVaults.add(result.vaultId);
+
+      const vault = vaults[result.vaultId];
+      if (!vault) continue;
+
+      try {
+        await step.do(`attest-vault-${result.vaultId}`, async () => {
+          // Hash the vault's collateral state
+          const attestData = JSON.stringify({
+            vaultId: result.vaultId,
+            collateralAssets: vault.payload.collateralAssets,
+            collateralValue: result.collateralValue,
+            timestamp: Date.now(),
+          });
+          const hashBuffer = await crypto.subtle.digest(
+            'SHA-256',
+            new TextEncoder().encode(attestData),
+          );
+          const proofHash = Array.from(new Uint8Array(hashBuffer))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join('');
+          const attestedAt = new Date().toISOString();
+
+          // Store proof to KV for UI retrieval
+          await env.PRIVAMARGIN_CONFIG.put(`zkproof:${proofHash}`, JSON.stringify({
+            type: 'sha256-operator',
+            vaultId: result.vaultId,
+            collateralValue: result.collateralValue,
+            attestedAt,
+          }), { expirationTtl: 86400 }); // 24h TTL
+
+          // Exercise OperatorAttestCollateral on all positions for this vault
+          const vaultPositions = ltvResults.filter(r =>
+            r.vaultId === result.vaultId && !liquidatedPositionIds.has(r.positionId)
+          );
+          for (const vp of vaultPositions) {
+            const current = await cantonQuery(env, POSITION_TEMPLATE, { positionId: vp.positionId });
+            const active = current.find((c: PositionContract) =>
+              c.payload.status === 'Open' || c.payload.status === 'MarginCalled'
+            );
+            if (!active) continue;
+            try {
+              await cantonExercise(
+                env,
+                active.contractId,
+                POSITION_TEMPLATE,
+                'OperatorAttestCollateral',
+                { proofHash, attestedAt },
+              );
+              console.log(`[Attest] ${vp.positionId}: hash=${proofHash.slice(0, 16)}...`);
+            } catch (err) {
+              console.warn(`[Attest] Failed for ${vp.positionId}:`, err);
+            }
+          }
+        });
+      } catch (err) {
+        console.error(`[Attest] Vault ${result.vaultId} attestation failed:`, err);
       }
     }
 

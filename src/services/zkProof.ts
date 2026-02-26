@@ -52,6 +52,23 @@ export function ltvToBps(ltvDecimal: number): number {
 export async function generateLTVProof(input: ZKVerificationInput): Promise<ZKProofResult> {
   const { assetValuesCents, notionalValueCents, ltvThresholdBps } = input;
 
+  // Circuit has fixed-width Num2Bits constraints. The LTV output (bps) and intermediates
+  // must fit within the circuit's bit width. Extreme LTV ratios (e.g., collateral ≈ $0
+  // vs large notional) produce values that overflow, crashing the witness generator.
+  // Skip proof generation if estimated LTV exceeds circuit capacity.
+  const MAX_LTV_BPS = 50000; // 500% — well above any meaningful threshold
+  const totalCollateralCents = assetValuesCents.reduce((s, v) => s + v, 0);
+  if (totalCollateralCents <= 0) {
+    throw new Error('Cannot generate ZK proof: collateral is zero');
+  }
+  const estimatedLTVBps = Math.round(notionalValueCents * 10000 / totalCollateralCents);
+  if (estimatedLTVBps > MAX_LTV_BPS) {
+    throw new Error(
+      `LTV too extreme for circuit (${estimatedLTVBps} bps > ${MAX_LTV_BPS} bps limit). ` +
+      `Collateral is negligible relative to notional.`
+    );
+  }
+
   // Pad asset values to MAX_ASSETS with zeros
   const paddedAssets = new Array(MAX_ASSETS).fill('0');
   for (let i = 0; i < Math.min(assetValuesCents.length, MAX_ASSETS); i++) {

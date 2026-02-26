@@ -514,11 +514,11 @@ For each asset in priority order:
 **Phase 3 — Execute** (only planned amounts are touched):
 ```
 For each planned seizure with seizeNative > 0:
-  USDC → encodeLiquidateERC20(usdcAddr, brokerAddr, partialAmount)
-  ETH  → encodeLiquidateETH(brokerAddr, partialWei, recalculatedAmountOutMin)
-  CC   → withdraw full entry from Daml vault
-         transfer partial amount to broker via custodian
-         re-deposit remainder back into vault (if any)
+  USDC      → encodeLiquidateERC20(usdcAddr, brokerAddr, partialAmount)
+  ETH       → encodeLiquidateETH(brokerAddr, partialWei, recalculatedAmountOutMin)
+  USDC_CANTON → transfer USDCHolding from custodian to broker (/api/custodian/withdraw-usdc)
+  CC/CUSDC  → swap CC value to USDC, transfer USDC to broker (/api/custodian/withdraw-usdc)
+              fire-and-forget: replenish custodian USDC via /api/swap/cc-to-usdc
 ```
 
 ### Seizure Priority Order
@@ -535,20 +535,27 @@ For each planned seizure with seizeNative > 0:
 
 **ETH**: `seizeWei = min(ethBalance, BigInt(Math.floor(seizeUSD / ethPrice * 1e18)))` — Calls `liquidate()` on the escrow contract. `amountOutMin` is recalculated based on the partial USD value (not the full balance). The escrow wraps partial ETH to WETH, swaps via Uniswap V3, and sends USDC to broker. Remaining ETH stays in escrow.
 
-**CC (partial — only for the last CC entry if needed)**:
-1. `WithdrawAsset` removes the full CC entry from Daml vault (all-or-nothing constraint)
-2. Transfer `seizeAmount` to broker via `/api/custodian/withdraw`
-3. If `remainder > 0`: re-deposit via `AssetIssuance → Accept → DepositAsset` pattern (same mint flow used by all deposits)
+**CC/CUSDC**: All CC-denominated collateral is settled in USDC. The seized CC value is converted to a USDC amount at the live CC/USD price, and the custodian transfers that USDC to the broker via Canton JSON API (`/api/custodian/withdraw-usdc`). The vault ledger is depleted via `SeizeCollateral`. After the broker receives USDC, a fire-and-forget call to `/api/swap/cc-to-usdc` replenishes the custodian's USDC reserves by swapping the CC with the bridge operator.
 
-**CC (whole entry)**: Same as above but `seizeAmount == entry.amount`, so no re-deposit needed.
+**USDC_CANTON**: Direct transfer of Canton USDCHolding from custodian to broker via `/api/custodian/withdraw-usdc` (Split + Transfer on the Daml contract).
+
+### CC→USDC Swap (Custodian Replenishment)
+
+After a liquidation involving CC collateral, the custodian's USDC reserves are depleted (USDC was sent to the broker). The `/api/swap/cc-to-usdc` endpoint replenishes the custodian by executing a same-chain Canton swap:
+
+1. **Custodian → CC → Bridge Operator**: Creates a Splice TransferOffer from custodian to bridge operator, auto-accepts it
+2. **Bridge Operator → USDC → Custodian**: Transfers equivalent USDCHolding from bridge operator to custodian via Canton JSON API
+
+This runs fire-and-forget after the liquidation completes. If it fails, the broker still received their USDC — the only impact is the custodian's reserves aren't replenished until the next successful swap.
 
 ### What Arrives at the Broker
 
 | Asset Seized | Broker Receives | Mechanism |
 |-------------|----------------|-----------|
-| USDC | USDC (same amount) | Direct ERC20 transfer to broker's EVM address |
+| USDC (EVM) | USDC (same amount) | Direct ERC20 transfer to broker's EVM address |
 | ETH | USDC (swap output) | Uniswap V3 WETH→USDC swap, USDC sent to broker's EVM address |
-| CC | CC (Canton Coin) | Splice custodian transfer to broker's Canton party |
+| USDC (Canton) | USDC (same amount) | USDCHolding Transfer to broker's Canton party |
+| CC/CUSDC | USDC (equivalent value) | CC value converted to USDC at live price, USDCHolding Transfer to broker |
 
 ### Liquidation Record
 
@@ -579,6 +586,71 @@ Every liquidation stores a `LiquidationRecord` with full audit trail:
 ```
 
 Records are accessible via `positionAPI.getLiquidationRecord(positionId)` and displayed in the Position Detail Dialog.
+
+---
+
+## Settlement Status
+
+### What Works
+
+| Flow | Asset | Status | Mechanism |
+|------|-------|--------|-----------|
+| Liquidation | CC/CUSDC | **Working** | Vault ledger depleted via `SeizeCollateral`. Custodian sends USDC to broker (`withdraw-usdc`). Custodian replenished via `cc-to-usdc` swap (fire-and-forget). |
+| Liquidation | USDC (Canton) | **Working** | Direct `USDCHolding` transfer from custodian to broker via Canton JSON API. |
+| Liquidation | USDC (EVM) | **Partial** | Seized from escrow via `liquidateERC20`. Custodian fronts USDC to broker on Canton. **Gap**: EVM USDC lands at operator bridge address but is never bridged back to Canton — custodian not replenished. |
+| Liquidation | ETH (EVM) | **Partial** | Seized from escrow, swapped to USDC via Uniswap V3. Custodian fronts USDC to broker on Canton. **Gap**: same as EVM USDC — swapped USDC sits at operator bridge address, custodian not replenished. |
+| Normal close | All | **Not implemented** | `ClosePosition` only flips Daml status to `Closed`. No collateral return, no PnL settlement, no asset movement. |
+| Margin call | All | **Not implemented** | `settleMarginCall` is a stub. |
+
+### Seizure Priority (Mixed-Asset Vaults)
+
+When a vault holds multiple asset types, liquidation seizes in this order:
+
+| Priority | Asset | Rationale |
+|----------|-------|-----------|
+| 1 | USDC (Canton + EVM) | 1:1 value, no swap risk |
+| 2 | CUSDC | Stable, Canton-native |
+| 3 | CC | Requires CC→USDC swap |
+| 4 | ETH | Volatile, Uniswap slippage |
+
+The algorithm walks down the priority list, seizing only what's needed to cover `|PnL|`. If the first asset covers the debt, lower-priority assets are untouched. Partial seizures are supported within each asset.
+
+### Open Questions — Settlement Design
+
+**1. Normal close PnL settlement**
+
+Not yet designed. When a position closes normally:
+- **Fund wins** (positive PnL): broker owes fund. Where does the USDC come from? Broker reserves? A settlement pool? Post-trade netting?
+- **Fund loses** (negative PnL): fund owes broker. Seize proportionally from vault (same as liquidation)? Or does the fund pay separately?
+- **Collateral return**: after settlement, remaining vault collateral should be released back to the fund. No release mechanism exists.
+
+**2. Settlement method — from-vault vs post-paid**
+
+Two approaches, not yet decided:
+- **From-vault (immediate)**: on close, seize the owed amount directly from vault collateral (mirrors liquidation). Simple but requires the vault to remain funded until close.
+- **Post-paid (deferred)**: record the PnL on-ledger, settle separately via a netting/payment flow. More flexible but requires a settlement layer that doesn't exist yet.
+
+For liquidation, settlement is currently from-vault (custodian fronts USDC, vault is depleted). Whether normal close should follow the same pattern is TBD.
+
+**3. EVM bridge replenishment**
+
+After EVM liquidation, seized USDC arrives at the operator's bridge EVM address. The custodian fronts equivalent USDC to the broker on Canton but is never replenished from the EVM side. Needs a bridge-back flow:
+- Operator bridge EVM address → StratosSwap bridge → Canton USDC → custodian
+- Or: operator periodically sweeps the bridge address and credits custodian off-chain
+
+**4. Mixed-asset close settlement**
+
+If a vault holds ETH + CC + USDC and the position closes with a loss:
+- Does the seizure priority order apply (same as liquidation)?
+- Can the fund choose which asset to settle with?
+- What about partial vault release — if only some collateral is needed for settlement, how is the remainder returned?
+
+**5. Multi-position vault settlement**
+
+A single vault can back multiple positions. When one position closes:
+- How much collateral is attributable to this position vs others?
+- Can collateral be released if other positions are still open?
+- Is settlement per-position or netted across all positions in the vault?
 
 ---
 
@@ -869,6 +941,8 @@ Serverless API endpoints deployed alongside the frontend. Use Cloudflare KV (`PR
 | `/api/escrow/balances` | GET | Read on-chain ETH + USDC balances for an escrow address |
 | `/api/custodian/accept-deposit` | POST | Accept CC transfer offers on custodian's behalf via Splice API |
 | `/api/custodian/withdraw` | POST | Create CC transfer from custodian to user via Splice API |
+| `/api/custodian/withdraw-usdc` | POST | Transfer USDCHolding from custodian to user via Canton JSON API (Split + Transfer) |
+| `/api/swap/cc-to-usdc` | POST | Swap custodian CC for bridge operator USDC — Splice CC transfer + USDCHolding transfer back |
 | `/api/auto-liquidate` | GET/POST | Broker auto-liquidate preferences per fund (KV-backed) |
 | `/api/zkproof` | GET/POST | ZK proof storage — POST stores proof JSON under `zkproof:{hash}` with 30-day TTL, GET `?hash=` retrieves full proof |
 | `/api/workflow/history` | GET | Workflow run history — list recent runs or fetch single run by timestamp |

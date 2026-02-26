@@ -223,6 +223,7 @@ export default function FundBrokerLinks({ user }: FundBrokerLinksProps) {
                       <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>Current</Typography>
                       <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'rgba(255,255,255,0.6)' }}>
                         {(proposal.currentThreshold * 100).toFixed(0)}%
+                        {proposal.currentLeverage != null && ` / ${proposal.currentLeverage}x`}
                       </Typography>
                     </Box>
                     <Typography sx={{ fontSize: 16, color: 'rgba(255,255,255,0.3)', alignSelf: 'flex-end', mb: 0.3 }}>→</Typography>
@@ -230,6 +231,7 @@ export default function FundBrokerLinks({ user }: FundBrokerLinksProps) {
                       <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>Proposed</Typography>
                       <Typography sx={{ fontSize: 16, fontWeight: 600, color: '#f59e0b' }}>
                         {(proposal.proposedThreshold * 100).toFixed(0)}%
+                        {proposal.proposedLeverage != null && ` / ${proposal.proposedLeverage}x`}
                       </Typography>
                     </Box>
                   </Box>
@@ -325,6 +327,19 @@ export default function FundBrokerLinks({ user }: FundBrokerLinksProps) {
                       <Typography sx={{ fontSize: 16, fontWeight: 600, color: '#f59e0b' }}>
                         {(link.ltvThreshold * 100).toFixed(0)}%
                       </Typography>
+                    </Box>
+                    <Box>
+                      <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', mb: 0.3 }}>Leverage</Typography>
+                      <Chip
+                        label={`${link.leverageRatio}x`}
+                        size="small"
+                        sx={{
+                          bgcolor: link.leverageRatio > 1 ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.08)',
+                          color: link.leverageRatio > 1 ? '#3b82f6' : 'rgba(255,255,255,0.5)',
+                          fontWeight: 700,
+                          fontSize: 13,
+                        }}
+                      />
                     </Box>
                     <Box>
                       <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', mb: 0.3 }}>Link ID</Typography>

@@ -16,18 +16,18 @@ import {
 } from './evmEscrow';
 
 // Truncate a number to 10 decimal places for Daml Numeric 10
-function toDecimal10(n: number): string {
+export function toDecimal10(n: number): string {
   const s = n.toFixed(10);
   return s.replace(/\.?0+$/, '') || '0';
 }
 
 // CPCV Package ID (deterministic hash - same across all participant nodes)
-// Must match the DAR file: daml/.daml/dist/privamargin8-0.1.0.dar
-const CPCV_PACKAGE_ID = '04e4abfad9464293823d9f7d6c0d4373ce4ddfbb7abe92bfbf06c87a9a733a53';
+// Must match the DAR file: daml/.daml/dist/privamargin9-0.1.0.dar
+const CPCV_PACKAGE_ID = '8b236fb5625487acc71d63fe6a8ba86e147e8c5c32db167e519437444f1092d6';
 
 // Template IDs for PrivaMargin Daml contracts (from cpcv-hackathon)
 // Format: PackageId:ModuleName:TemplateName
-const TEMPLATE_IDS = {
+export const TEMPLATE_IDS = {
   VAULT: `${CPCV_PACKAGE_ID}:CollateralVault:CollateralVault`,
   MARGIN_REQUIREMENT: `${CPCV_PACKAGE_ID}:MarginVerification:MarginRequirement`,
   MARGIN_CALL: `${CPCV_PACKAGE_ID}:MarginVerification:MarginCall`,
@@ -52,7 +52,7 @@ const TEMPLATE_IDS = {
 };
 
 // Choice names
-const CHOICES = {
+export const CHOICES = {
   // CollateralVault choices
   DEPOSIT_ASSET: 'DepositAsset',
   DEPOSIT_ASSET_WITH_TX: 'DepositAssetWithTx',
@@ -98,6 +98,7 @@ const CHOICES = {
   CLOSE_POSITION: 'ClosePosition',
   LIQUIDATE_POSITION: 'LiquidatePosition',
   ATTEST_COLLATERAL: 'AttestCollateral',
+  OPERATOR_ATTEST_COLLATERAL: 'OperatorAttestCollateral',
   // WorkflowMarginCall choices
   ACKNOWLEDGE_MARGIN_CALL: 'AcknowledgeMarginCall',
   RESOLVE_MARGIN_CALL: 'ResolveMarginCall',
@@ -162,7 +163,7 @@ function mapAssetTypeToEnum(assetType: string): string {
 }
 
 // Fallback asset prices — updated Feb 2026 (used only when CoinGecko is unreachable)
-const FALLBACK_PRICES: Record<string, number> = {
+export const FALLBACK_PRICES: Record<string, number> = {
   'BTC': 68000,
   'ETH': 2050,
   'SOL': 88,
@@ -195,7 +196,7 @@ let livePricesAreFresh = false; // true when CoinGecko responded successfully
 const PRICE_CACHE_TTL = 60_000; // 1 minute
 
 // Fetch live prices directly from CoinGecko (same source as wallet SDK)
-async function fetchLivePrices(): Promise<Record<string, number>> {
+export async function fetchLivePrices(): Promise<Record<string, number>> {
   const now = Date.now();
   if (now - livePriceCacheTime < PRICE_CACHE_TTL && Object.keys(livePriceCache).length > 0) {
     return livePriceCache;
@@ -274,7 +275,7 @@ let mockVerifications: Map<string, VerificationResult> = new Map();
 const isInIframe = window.parent !== window;
 
 // Get SDK instance
-const sdk = isInIframe ? getSDK() : null;
+const sdk = isInIframe ? getSDK({ timeout: 120000 }) : null;
 
 // Cached operator party (fetched from /api/config)
 let cachedOperatorParty: string | null = null;
@@ -494,8 +495,8 @@ export const vaultAPI = {
     // Try SDK first
     if (sdk) {
       try {
-        // Use dedicated custodian party for vault custody; fallback to operator or owner
-        const operatorParty = await getCustodianParty() || await getOperatorParty() || owner;
+        // Use operator party as vault observer (so LTV monitor can read vaults via SDK)
+        const operatorParty = await getOperatorParty() || owner;
 
         // Step 1: Create the vault (owner is sole signatory, operator is observer)
         const result = await sdk.cantonCreate({
@@ -510,7 +511,7 @@ export const vaultAPI = {
             depositRecords: null,
           },
         });
-        console.log('Created vault:', result.contractId);
+        console.log(`Created vault: ${result.contractId}, operator(observer)=${operatorParty}`);
 
         // Step 2: If initial assets provided, mint them and deposit into vault
         if (initialAssets && initialAssets.length > 0) {
@@ -2426,7 +2427,7 @@ export interface LiquidationRecord {
     symbol: string;
     amount: number;
     valueUSD: number;
-    source: 'bridge' | 'direct';
+    source: 'bridge' | 'direct' | 'cc-swap';
   }>;
   brokerRecipient: string;
   brokerCantonParty: string;
@@ -2476,23 +2477,36 @@ function contractToPosition(c: CantonContract<Record<string, unknown>>): Positio
 // ZK proof KV helpers — store/fetch full proofs via Pages Function
 async function storeZKProofToKV(hash: string, proofData: unknown): Promise<void> {
   try {
-    await fetch('/api/zkproof', {
+    const res = await fetch('/api/zkproof', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hash, proof: proofData }),
     });
-  } catch {
-    // fire-and-forget — ZK storage failure is non-critical
+    if (!res.ok) {
+      console.warn(`[ZK Store] POST /api/zkproof failed: ${res.status} ${await res.text().catch(() => '')}`);
+    } else {
+      console.log(`[ZK Store] Proof stored OK: hash=${hash.slice(0, 16)}...`);
+    }
+  } catch (err) {
+    console.warn('[ZK Store] Failed to store proof to KV:', err);
   }
 }
 
 export async function fetchZKProof(hash: string): Promise<unknown | null> {
   try {
     const res = await fetch(`/api/zkproof?hash=${encodeURIComponent(hash)}`);
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.warn(`[ZK Fetch] GET /api/zkproof?hash=${hash.slice(0, 16)}... → ${res.status}`);
+      return null;
+    }
     const data = await res.json();
-    return (data as Record<string, unknown>).proof || null;
-  } catch {
+    const proof = (data as Record<string, unknown>).proof || null;
+    if (!proof) {
+      console.warn(`[ZK Fetch] Response OK but proof field missing/empty for hash=${hash.slice(0, 16)}...`);
+    }
+    return proof;
+  } catch (err) {
+    console.warn('[ZK Fetch] Failed to fetch proof from KV:', err);
     return null;
   }
 }
@@ -2502,77 +2516,11 @@ export async function fetchZKProof(hash: string): Promise<unknown | null> {
 async function recalcPositionsLive(positions: PositionData[]): Promise<PositionData[]> {
   if (positions.length === 0 || !sdk) return positions;
 
-  const prices = await fetchLivePrices();
+  // LTV is the operator monitor's source of truth (on-ledger currentLTV / unrealizedPnL).
+  // No client-side recalc — fund, broker, and operator all see the same value.
+  // The only client-side work here is ZK proof generation by the fund.
 
-  // Fetch unique vaults and recalc their value
-  const uniqueVaultIds = [...new Set(positions.map(p => p.vaultId))];
-  const vaultValues: Record<string, number> = {};
-  for (const vid of uniqueVaultIds) {
-    try {
-      const vaults = await sdk.cantonQuery({ templateId: TEMPLATE_IDS.VAULT, filter: { vaultId: vid } });
-      if (vaults.length > 0) {
-        const vault = await recalcVaultPrices(contractToVault(vaults[0]));
-        vaultValues[vid] = vault.totalValue;
-      }
-    } catch { /* use 0 */ }
-  }
-
-  // Compute per-position PnL (only for active positions; closed/liquidated keep their on-ledger value)
-  const withPnL = positions.map(pos => {
-    if (pos.status === 'Closed' || pos.status === 'Liquidated') {
-      return pos;
-    }
-    const entryPrice = pos.entryPrice || 0;
-    const units = pos.units || 0;
-    const symbol = pos.description.trim().split(/\s+/).pop() || '';
-    const currentPrice = prices[symbol] || 0;
-    let pnl = 0;
-    if (entryPrice && units && currentPrice) {
-      pnl = pos.direction === 'Short'
-        ? units * (entryPrice - currentPrice)
-        : units * (currentPrice - entryPrice);
-    }
-    return { ...pos, unrealizedPnL: pnl };
-  });
-
-  // Aggregate notional + PnL per vault (open/margin-called only)
-  const vaultAgg: Record<string, { totalNotional: number; totalPnL: number }> = {};
-  for (const pos of withPnL) {
-    if (pos.status !== 'Open' && pos.status !== 'MarginCalled') continue;
-    if (!vaultAgg[pos.vaultId]) vaultAgg[pos.vaultId] = { totalNotional: 0, totalPnL: 0 };
-    vaultAgg[pos.vaultId].totalNotional += pos.notionalValue;
-    vaultAgg[pos.vaultId].totalPnL += pos.unrealizedPnL;
-  }
-
-  // Fetch broker-fund links to get per-link leverage ratio
-  const brokerFundPairs = [...new Set(positions.map(p => `${p.broker}|${p.fund}`))];
-  const linkLeverageMap: Record<string, number> = {};
-  for (const pair of brokerFundPairs) {
-    const [broker, fund] = pair.split('|');
-    try {
-      const linkContracts = await sdk.cantonQuery({ templateId: TEMPLATE_IDS.BROKER_FUND_LINK, filter: { broker, fund } });
-      if (linkContracts.length > 0) {
-        const lp = linkContracts[0].payload as Record<string, unknown>;
-        const rawLev = lp.leverageRatio;
-        linkLeverageMap[pair] = rawLev != null ? (typeof rawLev === 'string' ? parseFloat(rawLev) : (rawLev as number)) || 1 : 1;
-      }
-    } catch { /* default to 1 */ }
-  }
-
-  // Recalc collateralValue and LTV (leverage-aware)
-  const result = withPnL.map(pos => {
-    const collateral = vaultValues[pos.vaultId];
-    // If vault wasn't visible (e.g. broker can't see fund's vault), keep on-ledger LTV
-    if (collateral === undefined) {
-      return pos;
-    }
-    const agg = vaultAgg[pos.vaultId];
-    const effectiveCollateral = collateral + (agg?.totalPnL || 0);
-    const totalNotional = agg?.totalNotional || pos.notionalValue;
-    const leverage = linkLeverageMap[`${pos.broker}|${pos.fund}`] || 1;
-    const ltv = effectiveCollateral > 0 ? totalNotional / (effectiveCollateral * leverage) : (totalNotional > 0 ? 999 : 0);
-    return { ...pos, collateralValue: collateral, currentLTV: ltv };
-  });
+  const result = [...positions];
 
   // ZK proof generation — fund only, one proof per vault, skip if recent proof exists
   try {
@@ -2584,46 +2532,84 @@ async function recalcPositionsLive(positions: PositionData[]): Promise<PositionD
       const { generateLTVProof, proofHash: computeProofHash, usdToCents, isZKAvailable } =
         await import('./zkProof');
 
-      if (await isZKAvailable()) {
-        // Group active positions by vault
-        const vaultPositions: Record<string, PositionData[]> = {};
-        for (const pos of result) {
-          if (pos.status !== 'Open' && pos.status !== 'MarginCalled') continue;
-          if (pos.fund !== currentParty) continue;
-          if (!vaultPositions[pos.vaultId]) vaultPositions[pos.vaultId] = [];
-          vaultPositions[pos.vaultId].push(pos);
+      const zkAvail = await isZKAvailable();
+      if (!zkAvail) return result;
+
+      // Fetch vault values and link leverage (only for ZK proof inputs)
+      const uniqueVaultIds = [...new Set(result.filter(p => p.status === 'Open' || p.status === 'MarginCalled').map(p => p.vaultId))];
+      const vaultValues: Record<string, number> = {};
+      for (const vid of uniqueVaultIds) {
+        try {
+          const vaults = await sdk.cantonQuery({ templateId: TEMPLATE_IDS.VAULT, filter: { vaultId: vid } });
+          if (vaults.length > 0) {
+            const vault = await recalcVaultPrices(contractToVault(vaults[0]));
+            vaultValues[vid] = vault.totalValue;
+          }
+        } catch { /* skip */ }
+      }
+
+      // Aggregate notional per vault
+      const vaultAgg: Record<string, number> = {};
+      for (const pos of result) {
+        if (pos.status !== 'Open' && pos.status !== 'MarginCalled') continue;
+        if (pos.fund !== currentParty) continue;
+        vaultAgg[pos.vaultId] = (vaultAgg[pos.vaultId] || 0) + pos.notionalValue;
+      }
+
+      // Fetch leverage ratios
+      const brokerFundPairs = [...new Set(result.map(p => `${p.broker}|${p.fund}`))];
+      const linkLeverageMap: Record<string, number> = {};
+      for (const pair of brokerFundPairs) {
+        const [broker, fund] = pair.split('|');
+        try {
+          const linkContracts = await sdk.cantonQuery({ templateId: TEMPLATE_IDS.BROKER_FUND_LINK, filter: { broker, fund } });
+          if (linkContracts.length > 0) {
+            const lp = linkContracts[0].payload as Record<string, unknown>;
+            const rawLev = lp.leverageRatio;
+            linkLeverageMap[pair] = rawLev != null ? (typeof rawLev === 'string' ? parseFloat(rawLev) : (rawLev as number)) || 1 : 1;
+          }
+        } catch { /* default to 1 */ }
+      }
+
+      // Group active positions by vault
+      const vaultPositions: Record<string, PositionData[]> = {};
+      for (const pos of result) {
+        if (pos.status !== 'Open' && pos.status !== 'MarginCalled') continue;
+        if (pos.fund !== currentParty) continue;
+        if (!vaultPositions[pos.vaultId]) vaultPositions[pos.vaultId] = [];
+        vaultPositions[pos.vaultId].push(pos);
+      }
+
+      const ZK_PROOF_MIN_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+      for (const [vid, vPositions] of Object.entries(vaultPositions)) {
+        // Skip if existing proof < 5 min old
+        const existingTs = vPositions[0]?.zkProofTimestamp;
+        if (existingTs && (Date.now() - new Date(existingTs).getTime()) < ZK_PROOF_MIN_INTERVAL) {
+          continue;
         }
 
-        const ZK_PROOF_MIN_INTERVAL = 5 * 60 * 1000; // 5 minutes
+        const collateral = vaultValues[vid];
+        if (collateral === undefined || collateral <= 0) continue;
 
-        for (const [vid, vPositions] of Object.entries(vaultPositions)) {
-          // Skip if existing proof < 5 min old
-          const existingTs = vPositions[0]?.zkProofTimestamp;
-          if (existingTs && (Date.now() - new Date(existingTs).getTime()) < ZK_PROOF_MIN_INTERVAL) {
-            continue;
-          }
+        const totalNotional = vaultAgg[vid] || 0;
+        if (totalNotional <= 0) continue;
 
-          const collateral = vaultValues[vid];
-          if (collateral === undefined || collateral <= 0) continue;
+        const refPos = vPositions[0];
+        const zkLeverage = linkLeverageMap[`${refPos.broker}|${refPos.fund}`] || 1;
 
-          const agg = vaultAgg[vid];
-          const totalNotional = agg?.totalNotional || 0;
-          if (totalNotional <= 0) continue;
-
-          // Use per-link leverage to scale the ZK threshold
-          const refPos = vPositions[0];
-          const zkLeverage = linkLeverageMap[`${refPos.broker}|${refPos.fund}`] || 1;
-          // Scale collateral by leverage for ZK proof: proves collateral * leverage >= notional at threshold
+        let hash: string;
+        let attestedAt: string;
+        try {
           const zkResult = await generateLTVProof({
             assetValuesCents: [usdToCents(collateral * zkLeverage)],
             notionalValueCents: usdToCents(totalNotional),
-            ltvThresholdBps: 8000, // 80% standard threshold (leverage already factored into collateral)
+            ltvThresholdBps: 8000,
           });
 
-          const hash = await computeProofHash(zkResult.proof);
-          const attestedAt = new Date().toISOString();
+          hash = await computeProofHash(zkResult.proof);
+          attestedAt = new Date().toISOString();
 
-          // Store full proof to KV (fire-and-forget)
           storeZKProofToKV(hash, {
             proof: zkResult.proof,
             publicSignals: zkResult.publicSignals,
@@ -2631,28 +2617,56 @@ async function recalcPositionsLive(positions: PositionData[]): Promise<PositionD
             vaultId: vid,
             attestedAt,
           });
+        } catch {
+          // Circuit can't handle extreme LTV — fall back to SHA-256
+          const fallbackData = JSON.stringify({
+            vaultId: vid, collateral, notional: totalNotional,
+            leverage: zkLeverage, timestamp: Date.now(),
+          });
+          const hashBuffer = await crypto.subtle.digest(
+            'SHA-256', new TextEncoder().encode(fallbackData),
+          );
+          hash = Array.from(new Uint8Array(hashBuffer))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+          attestedAt = new Date().toISOString();
 
-          // Exercise AttestCollateral on each position sharing this vault
-          for (const pos of vPositions) {
+          storeZKProofToKV(hash, {
+            type: 'sha256-fallback',
+            collateral, notional: totalNotional,
+            leverage: zkLeverage, vaultId: vid, attestedAt,
+          });
+        }
+
+        // Exercise AttestCollateral on each position in this vault
+        for (const pos of vPositions) {
+          try {
+            let cid = pos.contractId;
             try {
-              await sdk.cantonExercise({
+              const fresh = await sdk.cantonQuery({
                 templateId: TEMPLATE_IDS.POSITION,
-                contractId: pos.contractId,
-                choice: CHOICES.ATTEST_COLLATERAL,
-                argument: { proofHash: hash, attestedAt },
+                filter: { positionId: pos.positionId },
               });
-              // Update local result with new ZK fields
-              pos.zkCollateralProofHash = hash;
-              pos.zkProofTimestamp = attestedAt;
-            } catch {
-              // Individual attestation failure is non-critical
-            }
+              if (fresh.length > 0) {
+                cid = (fresh[0] as { contractId: string }).contractId;
+              }
+            } catch { /* use original */ }
+
+            await sdk.cantonExercise({
+              templateId: TEMPLATE_IDS.POSITION,
+              contractId: cid,
+              choice: CHOICES.ATTEST_COLLATERAL,
+              argument: { proofHash: hash, attestedAt },
+            });
+            pos.zkCollateralProofHash = hash;
+            pos.zkProofTimestamp = attestedAt;
+          } catch (err) {
+            console.warn(`[ZK] AttestCollateral failed for ${pos.positionId}:`, err);
           }
         }
       }
     }
-  } catch {
-    // ZK proof generation failure never blocks position loading
+  } catch (err) {
+    console.error('[ZK] proof generation error:', err);
   }
 
   return result;
@@ -2863,10 +2877,32 @@ export const positionAPI = {
     }
 
     // 5. Look up vault and compute live collateral value
-    const vaults = await sdk.cantonQuery({
+    //    The broker may not be an observer on the fund's vault, so the SDK
+    //    query can return 0 results.  Retry with readAs=[operator, fund]
+    //    so the Canton query runs with broader visibility.
+    let vaults = await sdk.cantonQuery({
       templateId: TEMPLATE_IDS.VAULT,
       filter: { vaultId: pos.vaultId },
     });
+    const vaultDebug: string[] = [`sdk=${vaults.length}`];
+    if (vaults.length === 0) {
+      // Try with operator + fund readAs for cross-party visibility
+      const opParty = await getOperatorParty();
+      const readAs = [pos.fund, opParty].filter(Boolean) as string[];
+      vaultDebug.push(`readAs=[${readAs.join(',')}]`);
+      if (readAs.length > 0) {
+        try {
+          vaults = await sdk.cantonQuery({
+            templateId: TEMPLATE_IDS.VAULT,
+            filter: { vaultId: pos.vaultId },
+            readAs,
+          });
+          vaultDebug.push(`retry=${vaults.length}`);
+        } catch (err) {
+          vaultDebug.push(`err=${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
     let liveCollateralValue = 0;
     if (vaults.length > 0) {
       const vaultLive = await recalcVaultPrices(contractToVault(vaults[0]));
@@ -2903,7 +2939,7 @@ export const positionAPI = {
     const escrowTxHashes: string[] = [];
     const seizureDebug: string[] = [];  // Track seizure steps for debugging
 
-    seizureDebug.push(`pnl=${pnl.toFixed(2)}, collateral=${liveCollateralValue.toFixed(2)}, seizureAmt=${liquidationAmountUSD.toFixed(2)}, vaults=${vaults.length}`);
+    seizureDebug.push(`pnl=${pnl.toFixed(2)}, collateral=${liveCollateralValue.toFixed(2)}, seizureAmt=${liquidationAmountUSD.toFixed(2)}, vaults=${vaults.length}, vault_lookup=[${vaultDebug.join('; ')}]`);
 
     // Only perform seizure if there is an amount owed AND vault exists
     if (liquidationAmountUSD > 0 && vaults.length > 0) {
@@ -3072,31 +3108,37 @@ export const positionAPI = {
       }
 
       // ── Phase 3: Execute ────────────────────────────────────────────
+      // Truncate to 10 decimal places (Daml Numeric 10 limit)
+      const truncDec10 = (n: number) => parseFloat(n.toFixed(10));
       // Track per-escrow records for the LiquidationRecord
       const escrowRecordMap = new Map<string, LiquidationRecord['escrowLiquidations'][0]>();
 
-      // Helper: bridge EVM USDC to Canton — transfer operator's existing CUSDC to broker
+      // Helper: bridge EVM seizure to Canton USDC — transfer custodian's USDCHolding to broker
       const bridgeToCanton = async (bridgeAmountUSD: number) => {
         if (bridgeAmountUSD <= 0) return;
         try {
-          // Transfer CUSDC from operator/custodian to broker via custodian withdraw
-          await fetch('/api/custodian/withdraw', {
+          const res = await fetch('/api/custodian/withdraw-usdc', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ receiverParty: pos.broker, amount: bridgeAmountUSD }),
           });
-          cantonSettlement.push({
-            symbol: 'CUSDC', amount: bridgeAmountUSD,
-            valueUSD: bridgeAmountUSD, source: 'bridge',
-          });
-          console.log(`[Liquidation] Bridged ${bridgeAmountUSD} CUSDC to broker on Canton`);
+          const data = await res.json() as { success?: boolean; error?: string };
+          if (!res.ok || !data.success) {
+            console.warn(`[Liquidation] Bridge USDC transfer failed:`, data.error);
+          } else {
+            cantonSettlement.push({
+              symbol: 'USDC', amount: bridgeAmountUSD,
+              valueUSD: bridgeAmountUSD, source: 'bridge',
+            });
+            console.log(`[Liquidation] Bridged ${bridgeAmountUSD} USDC to broker on Canton`);
+          }
         } catch (err) {
           console.warn('[Liquidation] Canton bridge failed:', err);
         }
       };
 
       // EVM seizure destination: operator bridge address (falls back to broker EVM)
-      const evmRecipient = operatorEvmAddr || brokerEvmAddr!.address;
+      const evmRecipient = operatorEvmAddr || brokerEvmAddr?.address || '';
 
       for (const plan of seizurePlan) {
         if (plan.type === 'USDC' && plan.seizeWei && plan.seizeWei > BigInt(0)) {
@@ -3159,7 +3201,7 @@ export const positionAPI = {
             const withdrawRes = await fetch('/api/custodian/withdraw-usdc', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ receiverParty: pos.broker, amount: plan.seizeNum }),
+              body: JSON.stringify({ receiverParty: pos.broker, amount: truncDec10(plan.seizeNum) }),
             });
             const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
             if (!withdrawRes.ok || !withdrawData.success) {
@@ -3175,25 +3217,39 @@ export const positionAPI = {
           cantonSettlement.push({ symbol: 'USDC', amount: plan.seizeNum, valueUSD: plan.seizeUSD, source: 'direct' });
 
         } else if ((plan.type === 'CC' || plan.type === 'CUSDC') && plan.seizeNum && plan.seizeNum > 0) {
-          // CC/CUSDC: record seizure, vault depletion handled by SeizeCollateral below
+          // CC/CUSDC → USDC swap: convert seized CC value to USDC and transfer to broker.
+          // SeizeCollateral depletes the vault ledger; custodian releases equivalent USDC.
+          const usdcAmount = truncDec10(plan.seizeUSD); // USD value of seized CC = USDC amount (1:1), truncated for Numeric 10
           try {
-            const withdrawRes = await fetch('/api/custodian/withdraw', {
+            seizureDebug.push(`CC_SWAP_USDC: ${plan.seizeNum} ${plan.type} ($${usdcAmount.toFixed(2)}) → USDC → broker=${pos.broker.split('::')[0]}`);
+            const withdrawRes = await fetch('/api/custodian/withdraw-usdc', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ receiverParty: pos.broker, amount: plan.seizeNum }),
+              body: JSON.stringify({ receiverParty: pos.broker, amount: usdcAmount }),
             });
-            const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
+            const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string; contractId?: string };
             if (!withdrawRes.ok || !withdrawData.success) {
-              console.warn(`[Liquidation] ${plan.type} transfer to broker failed:`, withdrawData.error);
+              seizureDebug.push(`CC_SWAP_FAIL: ${withdrawRes.status} ${withdrawData.error || JSON.stringify(withdrawData).slice(0, 200)}`);
             } else {
-              console.log(`[Liquidation] ${plan.type} transferred to broker: ${plan.seizeNum} ${plan.type}`);
+              seizureDebug.push(`CC_SWAP_OK: ${usdcAmount.toFixed(2)} USDC → broker, cid=${withdrawData.contractId?.slice(0, 16) || 'none'}`);
             }
           } catch (err) {
-            console.warn(`[Liquidation] ${plan.type} custodian transfer error:`, err);
+            seizureDebug.push(`CC_SWAP_ERROR: ${err instanceof Error ? err.message : String(err)}`);
           }
 
           ccSeized.push({ symbol: plan.type, amount: plan.seizeNum, valueUSD: plan.seizeUSD });
-          cantonSettlement.push({ symbol: plan.type, amount: plan.seizeNum, valueUSD: plan.seizeUSD, source: 'direct' });
+          cantonSettlement.push({ symbol: 'USDC', amount: usdcAmount, valueUSD: plan.seizeUSD, source: 'cc-swap' });
+
+          // Fire-and-forget: replenish custodian USDC by swapping the CC with bridge operator
+          fetch('/api/swap/cc-to-usdc', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ccAmount: truncDec10(plan.seizeNum), usdcAmount }),
+          }).then(r => r.json()).then((d: unknown) => {
+            const res = d as { success?: boolean; error?: string };
+            if (res.success) console.log(`[Liquidation] CC→USDC swap OK: ${plan.seizeNum} CC → ${usdcAmount} USDC`);
+            else console.warn(`[Liquidation] CC→USDC swap failed:`, res.error);
+          }).catch(err => console.warn('[Liquidation] CC→USDC swap error:', err));
         }
       }
 
@@ -3210,7 +3266,7 @@ export const positionAPI = {
         if (plan.seizeUSD <= 0) continue;
         if (plan.assetId) {
           // Canton-native: CC, CUSDC, USDC_CANTON — assetId comes directly from inventory
-          seizedVaultAssets.push({ assetId: plan.assetId, amount: plan.seizeNum || 0, valueUSD: plan.seizeUSD });
+          seizedVaultAssets.push({ assetId: plan.assetId, amount: truncDec10(plan.seizeNum || 0), valueUSD: plan.seizeUSD });
         } else if (plan.type === 'USDC' || plan.type === 'ETH') {
           // EVM assets: map type back to vault collateralAssets entry by symbol prefix
           const symbol = plan.type;
@@ -3219,7 +3275,7 @@ export const positionAPI = {
             const seizedAmount = plan.type === 'USDC'
               ? Number(plan.seizeWei || 0n) / 1e6
               : Number(plan.seizeWei || 0n) / 1e18;
-            seizedVaultAssets.push({ assetId: vaultEntry.assetId, amount: seizedAmount, valueUSD: plan.seizeUSD });
+            seizedVaultAssets.push({ assetId: vaultEntry.assetId, amount: truncDec10(seizedAmount), valueUSD: plan.seizeUSD });
           }
         }
       }
@@ -3227,37 +3283,60 @@ export const positionAPI = {
       seizureDebug.push(`seizedVaultAssets: ${seizedVaultAssets.map(s => `${s.assetId}=${s.amount}`).join(', ') || 'EMPTY'}`);
 
       if (seizedVaultAssets.length > 0) {
-        // Exercise SeizeCollateral via server-side endpoint (the vault's operator
-        // is the custodian party, which the wallet SDK can't actAs).
-        const freshVaults = await sdk.cantonQuery({
+        // Exercise SeizeCollateral via SDK (controller operator — same as LiquidatePosition).
+        // Use readAs=[fund, operator] fallback since broker can't see fund's vault.
+        let freshVaults = await sdk.cantonQuery({
           templateId: TEMPLATE_IDS.VAULT,
           filter: { vaultId: pos.vaultId },
         });
+        if (freshVaults.length === 0) {
+          const opParty = await getOperatorParty();
+          const readAs = [pos.fund, opParty].filter(Boolean) as string[];
+          if (readAs.length > 0) {
+            freshVaults = await sdk.cantonQuery({
+              templateId: TEMPLATE_IDS.VAULT,
+              filter: { vaultId: pos.vaultId },
+              readAs,
+            });
+          }
+        }
         let vaultCid = freshVaults[0]?.contractId;
+        seizureDebug.push(`vaultCid_for_seize=${vaultCid ? vaultCid.slice(0, 16) + '...' : 'NOT_FOUND'}, freshVaults=${freshVaults.length}`);
 
         if (vaultCid) {
+          // SeizeCollateral has controller=operator. Use the vault's operator party
+          // AND the position's operator in actAs so the SDK has proper authorization.
+          const vaultOperator = freshVaults[0]?.payload
+            ? (freshVaults[0].payload as Record<string, unknown>).operator as string
+            : '';
+          const seizeActAs = [...new Set([pos.operator, vaultOperator].filter(Boolean))];
+          seizureDebug.push(`seize_actAs=[${seizeActAs.map(p => p.split('::')[0]).join(',')}]`);
+
           for (const seized of seizedVaultAssets) {
             try {
-              const seizeRes = await fetch('/api/canton/seize-collateral', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  contractId: vaultCid,
-                  templateId: TEMPLATE_IDS.VAULT,
+              const seizeResult = await sdk.cantonExercise({
+                contractId: vaultCid,
+                templateId: TEMPLATE_IDS.VAULT,
+                choice: CHOICES.SEIZE_COLLATERAL,
+                argument: {
                   assetId: seized.assetId,
-                  seizeAmount: seized.amount.toString(),
+                  seizeAmount: toDecimal10(seized.amount),
                   reason: `Liquidation of position ${pos.positionId}`,
-                }),
+                },
+                actAs: seizeActAs,
               });
-              const seizeData = await seizeRes.json() as { success?: boolean; newContractId?: string; error?: string };
-              if (seizeData.success && seizeData.newContractId) {
-                vaultCid = seizeData.newContractId;
-              }
-              if (seizeData.success) {
-                seizureDebug.push(`SEIZED: ${seized.assetId} ${seized.amount} ($${seized.valueUSD.toFixed(2)})`);
+              // Verify the exercise actually committed by checking exerciseResult
+              const newCid = seizeResult?.exerciseResult as unknown as string
+                || seizeResult?.events?.find(
+                  (e: { templateId: string }) => e.templateId?.includes('CollateralVault')
+                )?.contractId;
+              if (newCid) {
+                vaultCid = newCid;
+                seizureDebug.push(`SEIZED: ${seized.assetId} ${seized.amount} ($${seized.valueUSD.toFixed(2)}) newCid=${newCid.slice(0, 16)}...`);
               } else {
-                seizureDebug.push(`SEIZE_FAIL: ${seized.assetId} → ${seizeData.error || seizeRes.status}`);
+                seizureDebug.push(`SEIZED(no-cid): ${seized.assetId} ${seized.amount} ($${seized.valueUSD.toFixed(2)}) result=${JSON.stringify(seizeResult).slice(0, 200)}`);
               }
+              console.log(`[Liquidation] SeizeCollateral OK: ${seized.assetId} ${seized.amount}`);
             } catch (err) {
               seizureDebug.push(`SEIZE_ERROR: ${seized.assetId} → ${err instanceof Error ? err.message : String(err)}`);
             }

@@ -9,16 +9,17 @@ name = "ltv-monitor-workflow"
 binding = "LTV_MONITOR_WORKFLOW"
 class_name = "LTVMonitorWorkflow"
 
-[triggers]
-crons = ["* * * * *"]
+# Cron disabled — LTV monitoring moved to operator Dashboard polling via SDK
+# [triggers]
+# crons = ["* * * * *"]
 
 [[kv_namespaces]]
 binding = "PRIVAMARGIN_CONFIG"
 id = "7c64523d0f71497183bd9a20295df71a"
 
 [vars]
-CANTON_HOST = "p2-json.cantondefi.com"
-PACKAGE_ID = "04e4abfad9464293823d9f7d6c0d4373ce4ddfbb7abe92bfbf06c87a9a733a53"
+CANTON_HOST = "p1-json.cantondefi.com"
+PACKAGE_ID = "8b236fb5625487acc71d63fe6a8ba86e147e8c5c32db167e519437444f1092d6"
 COINMARKETCAP_API_KEY = "441479ed834c4782a04e48d0cb2c2160"
 
 # EVM RPC endpoints

@@ -3,8 +3,9 @@
  *
  * Server-side function that exercises SeizeCollateral on a CollateralVault.
  * SeizeCollateral has `controller operator` which the frontend broker can't
- * exercise via the wallet SDK. This endpoint authenticates directly to the
- * Canton JSON API using JWT signed with CANTON_AUTH_SECRET.
+ * exercise via the wallet SDK. This endpoint authenticates to the Canton
+ * JSON API using CANTON_AUTH_TOKEN (same token the workflow uses) and acts
+ * as the OPERATOR_PARTY.
  *
  * Body: { contractId, templateId, assetId, seizeAmount, reason }
  * Returns: { success, newContractId }
@@ -12,8 +13,12 @@
 
 interface Env {
   CANTON_HOST: string;
-  CANTON_AUTH_SECRET: string;
-  CANTON_AUTH_USER: string;
+  CANTON_AUTH_TOKEN: string;
+  OPERATOR_PARTY?: string;
+  PRIVAMARGIN_CONFIG: KVNamespace;
+  // Fallback: self-signed JWT
+  CANTON_AUTH_SECRET?: string;
+  CANTON_AUTH_USER?: string;
   CANTON_AUTH_AUDIENCE?: string;
 }
 
@@ -42,7 +47,7 @@ async function generateCantonToken(env: Env): Promise<string> {
 
   const key = await crypto.subtle.importKey(
     'raw',
-    encoder.encode(env.CANTON_AUTH_SECRET),
+    encoder.encode(env.CANTON_AUTH_SECRET!),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign']
@@ -78,11 +83,39 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     }
 
     const cantonHost = env.CANTON_HOST;
-    if (!cantonHost || !env.CANTON_AUTH_SECRET) {
-      return jsonResponse({ error: 'Canton API not configured' }, 500);
+    if (!cantonHost) {
+      return jsonResponse({ error: 'CANTON_HOST not configured' }, 500);
     }
 
-    const token = await generateCantonToken(env);
+    // Use the same auth token as the workflow (has proper party claims)
+    const token = env.CANTON_AUTH_TOKEN || (env.CANTON_AUTH_SECRET ? await generateCantonToken(env) : '');
+    if (!token) {
+      return jsonResponse({ error: 'No CANTON_AUTH_TOKEN or CANTON_AUTH_SECRET configured' }, 500);
+    }
+
+    // Resolve operator party from env var or KV config
+    const operatorParty = env.OPERATOR_PARTY || await env.PRIVAMARGIN_CONFIG?.get('operatorParty') || '';
+
+    // Build exercise body with explicit actAs operator party
+    const exerciseBody: Record<string, unknown> = {
+      templateId,
+      contractId,
+      choice: 'SeizeCollateral',
+      argument: {
+        assetId,
+        seizeAmount,
+        reason: reason || 'Liquidation seizure',
+      },
+    };
+
+    // Include actAs in meta so Canton knows which party is exercising
+    if (operatorParty) {
+      exerciseBody.meta = {
+        actAs: [operatorParty],
+      };
+    }
+
+    console.log(`[seize-collateral] Exercising SeizeCollateral: asset=${assetId}, amount=${seizeAmount}, cid=${contractId.slice(0, 16)}..., operator=${operatorParty || 'MISSING'}`);
 
     const response = await fetch(`https://${cantonHost}/v1/exercise`, {
       method: 'POST',
@@ -90,16 +123,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        templateId,
-        contractId,
-        choice: 'SeizeCollateral',
-        argument: {
-          assetId,
-          seizeAmount,
-          reason: reason || 'Liquidation seizure',
-        },
-      }),
+      body: JSON.stringify(exerciseBody),
     });
 
     if (!response.ok) {

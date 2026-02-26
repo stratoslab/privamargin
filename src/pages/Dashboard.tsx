@@ -1,4 +1,4 @@
-import { useState, useEffect, Fragment } from 'react';
+import { useState, useEffect, useRef, Fragment } from 'react';
 import {
   Box, Typography, Button, Grid, CircularProgress, Alert,
   Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
@@ -9,7 +9,10 @@ import {
   Schedule, ExpandMore, ExpandLess, CheckCircle,
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
-import { vaultAPI, marginAPI, invitationAPI, positionAPI, linkAPI, workflowMarginCallAPI, getCustodianParty } from '../services/api';
+import { vaultAPI, marginAPI, invitationAPI, positionAPI, linkAPI, workflowMarginCallAPI, getCustodianParty, displaySymbol } from '../services/api';
+import { runLTVCheckCycle } from '../services/ltvMonitor';
+import type { WorkflowRunRecord } from '../services/ltvMonitor';
+import TokenIcon from '../components/TokenIcon';
 import type { PositionData, BrokerFundLinkData, WorkflowMarginCallData } from '../services/api';
 import { useRole } from '../context/RoleContext';
 import type { AuthUser, Asset } from '@stratos-wallet/sdk';
@@ -101,11 +104,24 @@ function FundDashboard({ user, assets }: DashboardProps) {
           if (await isZKAvailable()) {
             const vault = vaultsRes.data[0];
             const position = posRes.data[0];
+            // Fetch link to get per-link threshold and leverage
+            let linkThreshold = 0.8;
+            let linkLeverage = 1;
+            try {
+              const linkRes = await linkAPI.getLinksForFund(partyId);
+              const matchingLink = linkRes.data.find((l: any) => l.broker === position.broker);
+              if (matchingLink) {
+                linkThreshold = matchingLink.ltvThreshold || 0.8;
+                linkLeverage = matchingLink.leverageRatio || 1;
+              }
+            } catch { /* use defaults */ }
             const assetCents = (vault.collateralAssets || []).map((a: any) => usdToCents(a.valueUSD || 0));
+            // Scale collateral by leverage for ZK proof
+            const scaledAssetCents = assetCents.map((c: number) => c * linkLeverage);
             const result = await generateLTVProof({
-              assetValuesCents: assetCents,
+              assetValuesCents: scaledAssetCents,
               notionalValueCents: usdToCents(position.notionalValue || 0),
-              ltvThresholdBps: ltvToBps(0.8),
+              ltvThresholdBps: ltvToBps(linkThreshold),
             });
             const hash = await proofHash(result.proof);
             setZkProof(hash);
@@ -314,9 +330,17 @@ function FundDashboard({ user, assets }: DashboardProps) {
                       ${vault.totalValue.toLocaleString()}
                     </Typography>
                   </Box>
-                  <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>
-                    {vault.collateralAssets?.length || 0} assets
-                  </Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+                    {vault.collateralAssets?.length
+                      ? vault.collateralAssets.map((a: { assetType: string }, i: number) => (
+                          <Box key={i} sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                            <TokenIcon symbol={a.assetType} size={16} />
+                            <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.5)' }}>{displaySymbol(a.assetType)}</Typography>
+                          </Box>
+                        ))
+                      : <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>No assets</Typography>
+                    }
+                  </Box>
                 </Box>
               ))
             )}
@@ -839,44 +863,82 @@ function DeployerPanel() {
   );
 }
 
-// Workflow run record shape from KV
-interface WorkflowRunRecord {
-  timestamp: string;
-  processed: number;
-  marginCallsCreated: number;
-  positions: Array<{
-    positionId: string;
-    vaultId: string;
-    fund: string;
-    broker: string;
-    notional: number;
-    collateralValue: number;
-    pnl: number;
-    currentLTV: number;
-    breached: boolean;
-    autoLiquidated: boolean;
-  }>;
-  prices: { CC: number; ETH: number; BTC: number; USDC: number; SOL: number };
-}
-
-// Workflow Monitor Panel — shows recent LTV monitor workflow runs
+// Workflow Monitor Panel — operator-driven LTV polling via SDK
 function WorkflowLogPanel() {
   const [runs, setRuns] = useState<WorkflowRunRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedRow, setExpandedRow] = useState<string | null>(null);
+  const [monitoring, setMonitoring] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [countdown, setCountdown] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Load historical runs from KV on mount
   useEffect(() => {
     (async () => {
       try {
         const res = await fetch('/api/workflow/history?limit=20');
         const data = await res.json() as { runs: WorkflowRunRecord[] };
         setRuns(data.runs || []);
-      } catch {
-        // ignore
-      }
+      } catch { /* ignore */ }
       setLoading(false);
     })();
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (countdownRef.current) clearInterval(countdownRef.current);
+    };
   }, []);
+
+  const POLL_INTERVAL = 30; // seconds
+
+  const executeCheck = async () => {
+    setChecking(true);
+    setError(null);
+    try {
+      const record = await runLTVCheckCycle();
+      setRuns(prev => [record, ...prev].slice(0, 50));
+      // Persist to KV (fire-and-forget)
+      fetch('/api/workflow/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(record),
+      }).catch(() => {});
+    } catch (err: any) {
+      const msg = err?.message || 'LTV check failed';
+      if (msg !== 'LTV check cycle already running') {
+        setError(msg);
+        console.error('[LTV Monitor]', err);
+      }
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const startMonitor = () => {
+    setMonitoring(true);
+    setError(null);
+    // Run immediately
+    executeCheck();
+    // Start countdown
+    setCountdown(POLL_INTERVAL);
+    countdownRef.current = setInterval(() => {
+      setCountdown(prev => (prev <= 1 ? POLL_INTERVAL : prev - 1));
+    }, 1000);
+    // Poll every 30s
+    intervalRef.current = setInterval(() => {
+      executeCheck();
+      setCountdown(POLL_INTERVAL);
+    }, POLL_INTERVAL * 1000);
+  };
+
+  const stopMonitor = () => {
+    setMonitoring(false);
+    if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+    if (countdownRef.current) { clearInterval(countdownRef.current); countdownRef.current = null; }
+    setCountdown(0);
+  };
 
   const thSx = {
     color: 'rgba(255,255,255,0.5)',
@@ -899,9 +961,6 @@ function WorkflowLogPanel() {
   };
 
   const latestRun = runs[0];
-  const latestTime = latestRun
-    ? new Date(latestRun.timestamp).toLocaleString()
-    : '—';
 
   const rowColor = (run: WorkflowRunRecord) => {
     if (run.positions.some(p => p.autoLiquidated)) return 'rgba(239, 68, 68, 0.06)';
@@ -926,22 +985,48 @@ function WorkflowLogPanel() {
             width: 40,
             height: 40,
             borderRadius: '10px',
-            bgcolor: 'rgba(245,158,11,0.1)',
-            border: '2px solid #f59e0b',
+            bgcolor: monitoring ? 'rgba(0,212,170,0.1)' : 'rgba(245,158,11,0.1)',
+            border: `2px solid ${monitoring ? '#00d4aa' : '#f59e0b'}`,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
           }}
         >
-          <Schedule sx={{ color: '#f59e0b', fontSize: 20 }} />
+          {checking
+            ? <CircularProgress size={18} sx={{ color: '#f59e0b' }} />
+            : <Schedule sx={{ color: monitoring ? '#00d4aa' : '#f59e0b', fontSize: 20 }} />
+          }
         </Box>
         <Box sx={{ flex: 1 }}>
-          <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'white' }}>Workflow Monitor</Typography>
-          <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>LTV check runs every 15 minutes</Typography>
+          <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'white' }}>LTV Monitor</Typography>
+          <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>
+            {checking ? 'Checking...' : monitoring ? `Next check in ${countdown}s` : 'Stopped'}
+          </Typography>
         </Box>
+        <Button
+          variant="contained"
+          onClick={monitoring ? stopMonitor : startMonitor}
+          disabled={checking && !monitoring}
+          sx={{
+            bgcolor: monitoring ? 'rgba(239,68,68,0.15)' : 'rgba(0,212,170,0.15)',
+            color: monitoring ? '#ef4444' : '#00d4aa',
+            fontWeight: 600,
+            fontSize: 12,
+            px: 2.5,
+            py: 0.8,
+            borderRadius: '8px',
+            textTransform: 'none',
+            border: `1px solid ${monitoring ? 'rgba(239,68,68,0.3)' : 'rgba(0,212,170,0.3)'}`,
+            '&:hover': {
+              bgcolor: monitoring ? 'rgba(239,68,68,0.25)' : 'rgba(0,212,170,0.25)',
+            },
+          }}
+        >
+          {monitoring ? 'Stop Monitor' : 'Start Monitor'}
+        </Button>
         {latestRun && (
           <Chip
-            label={`Last: ${latestTime}`}
+            label={`Last: ${new Date(latestRun.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`}
             size="small"
             sx={{
               bgcolor: 'rgba(245,158,11,0.1)',
@@ -953,6 +1038,13 @@ function WorkflowLogPanel() {
           />
         )}
       </Box>
+
+      {/* Error alert */}
+      {error && (
+        <Alert severity="error" sx={{ mb: 2, bgcolor: 'rgba(239,68,68,0.1)', color: '#ef4444', '& .MuiAlert-icon': { color: '#ef4444' } }}>
+          {error}
+        </Alert>
+      )}
 
       {/* Summary stats */}
       {latestRun && (
@@ -976,6 +1068,14 @@ function WorkflowLogPanel() {
         </Box>
       )}
 
+      {/* Exercise errors from latest run */}
+      {latestRun?.errors && latestRun.errors.length > 0 && (
+        <Alert severity="warning" sx={{ mb: 2, bgcolor: 'rgba(245,158,11,0.1)', color: '#f59e0b', '& .MuiAlert-icon': { color: '#f59e0b' } }}>
+          {latestRun.errors.length} exercise error(s): {latestRun.errors.slice(0, 3).join('; ')}
+          {latestRun.errors.length > 3 && ` (+${latestRun.errors.length - 3} more)`}
+        </Alert>
+      )}
+
       {/* Table */}
       {loading ? (
         <Box sx={{ textAlign: 'center', py: 4 }}>
@@ -986,7 +1086,7 @@ function WorkflowLogPanel() {
           <Schedule sx={{ fontSize: 32, color: 'rgba(255,255,255,0.15)', mb: 1 }} />
           <Typography sx={{ fontSize: 14, color: 'rgba(255,255,255,0.5)' }}>No workflow runs recorded yet</Typography>
           <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.3)', mt: 0.5 }}>
-            Records appear after the next scheduled LTV check
+            Click "Start Monitor" to begin LTV checks
           </Typography>
         </Box>
       ) : (
@@ -1005,7 +1105,7 @@ function WorkflowLogPanel() {
               </TableRow>
             </TableHead>
             <TableBody>
-              {runs.map((run) => {
+              {runs.slice(0, 20).map((run) => {
                 const isExpanded = expandedRow === run.timestamp;
                 const breaches = run.positions.filter(p => p.breached).length;
                 const autoLiqs = run.positions.filter(p => p.autoLiquidated).length;

@@ -58,6 +58,16 @@ template Position
           zkCollateralProofHash = Some proofHash
           zkProofTimestamp = Some attestedAt
 
+    choice OperatorAttestCollateral: ContractId Position
+      with
+        proofHash: Text
+        attestedAt: Text
+      controller operator
+      do
+        create this with
+          zkCollateralProofHash = Some proofHash
+          zkProofTimestamp = Some attestedAt
+
     choice ClosePosition: ContractId Position
       with
         finalPnL: Optional Decimal
