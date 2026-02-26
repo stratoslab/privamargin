@@ -952,6 +952,17 @@ npm run build:dar
 
 Compiles Daml sources in `daml/src/`, updates `PACKAGE_ID` in `wrangler.toml` to the new DAR hash, and copies the DAR file to `public/package.dar`.
 
+### Deploy DAR to Canton
+
+After building the DAR, upload it to all Canton participant nodes. The portal UI at each participant provides a DAR upload page:
+
+1. Open the Canton participant portal (e.g. `https://p1.cantondefi.com`, `https://p2.cantondefi.com`)
+2. Navigate to the DAR upload / package management section
+3. Upload `daml/.daml/dist/privamargin6-0.1.0.dar`
+4. Repeat for each participant node that needs the updated contracts
+
+The new package must be deployed to all participants before the frontend or workflow can use the updated templates and choices (e.g. `AttestCollateral`).
+
 ### Build ZK Circuit (optional — artifacts may be pre-built)
 
 ```bash
