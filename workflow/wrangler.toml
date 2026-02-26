@@ -18,7 +18,7 @@ id = "7c64523d0f71497183bd9a20295df71a"
 
 [vars]
 CANTON_HOST = "p2-json.cantondefi.com"
-PACKAGE_ID = "5240415c3ba99ccac4f73d5c8243d909cd08b8ec2bdf7c87c54645ad99595fb6"
+PACKAGE_ID = "04e4abfad9464293823d9f7d6c0d4373ce4ddfbb7abe92bfbf06c87a9a733a53"
 COINMARKETCAP_API_KEY = "441479ed834c4782a04e48d0cb2c2160"
 
 # EVM RPC endpoints
@@ -33,6 +33,12 @@ SPLICE_HOST = "p1.cantondefi.com"
 SPLICE_PORT = "443"
 CANTON_AUTH_AUDIENCE = "https://canton.network.global"
 CUSTODIAN_USER = "vault-custodian"
+
+# Canton USDC transfer (custodian → broker via JSON API v2)
+# USDC_TEMPLATE_ID must match the USDCHolding Daml template on your Canton participant
+# SPLICE_ADMIN_USER is the admin user that has actAs rights on the custodian party
+SPLICE_ADMIN_USER = "app-user"
+# USDC_TEMPLATE_ID = ""  # Set after deploying USDCHolding DAR
 
 # Secrets (set via `wrangler secret put`):
 # - CANTON_AUTH_TOKEN

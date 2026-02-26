@@ -22,8 +22,8 @@ function toDecimal10(n: number): string {
 }
 
 // CPCV Package ID (deterministic hash - same across all participant nodes)
-// Must match the DAR file: daml/.daml/dist/privamargin6-0.1.0.dar
-const CPCV_PACKAGE_ID = '5240415c3ba99ccac4f73d5c8243d909cd08b8ec2bdf7c87c54645ad99595fb6';
+// Must match the DAR file: daml/.daml/dist/privamargin8-0.1.0.dar
+const CPCV_PACKAGE_ID = '04e4abfad9464293823d9f7d6c0d4373ce4ddfbb7abe92bfbf06c87a9a733a53';
 
 // Template IDs for PrivaMargin Daml contracts (from cpcv-hackathon)
 // Format: PackageId:ModuleName:TemplateName
@@ -82,6 +82,7 @@ const CHOICES = {
   ACCEPT_INVITATION: 'AcceptInvitation',
   REJECT_INVITATION: 'RejectInvitation',
   SET_LTV_THRESHOLD: 'SetLTVThreshold',
+  SET_LEVERAGE_RATIO: 'SetLeverageRatio',
   DEACTIVATE_LINK: 'DeactivateLink',
   PROPOSE_LTV_CHANGE: 'ProposeLTVChange',
   // BrokerFundLink allowed assets / collaterals
@@ -1114,6 +1115,13 @@ export const vaultAPI = {
       .sort((a, b) => a.amount - b.amount); // smallest first, greedily consume
 
     let damlRemaining = withdrawAmount;
+    const damlCleanupErrors: string[] = [];
+
+    if (rawMatching.length === 0) {
+      console.warn(`[withdrawFromEscrow] No matching Daml entries found for ${withdrawSymbol} (vault has ${rawAssets.length} total entries)`);
+      damlCleanupErrors.push(`No Daml entries found for ${withdrawSymbol}`);
+    }
+
     for (const entry of rawMatching) {
       if (damlRemaining <= 0.001) break;
       try {
@@ -1121,7 +1129,10 @@ export const vaultAPI = {
           templateId: TEMPLATE_IDS.VAULT,
           filter: { vaultId }
         });
-        if (freshVaults.length === 0) break;
+        if (freshVaults.length === 0) {
+          damlCleanupErrors.push('Vault not found during cleanup');
+          break;
+        }
 
         await sdk.cantonExercise({
           contractId: freshVaults[0].contractId,
@@ -1129,6 +1140,7 @@ export const vaultAPI = {
           choice: CHOICES.WITHDRAW_ASSET,
           argument: { assetId: entry.assetId, issuer: owner }
         });
+        console.log(`[withdrawFromEscrow] Removed Daml entry ${entry.assetId}: ${entry.amount} ${withdrawSymbol}`);
 
         // Re-deposit excess if this entry was larger than what we need
         if (entry.amount > damlRemaining + 0.001) {
@@ -1171,17 +1183,29 @@ export const vaultAPI = {
 
         damlRemaining -= entry.amount;
       } catch (err) {
-        console.warn(`[withdrawFromEscrow] Daml entry removal failed for ${entry.assetId}:`, err);
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[withdrawFromEscrow] Daml entry removal FAILED for ${entry.assetId}:`, err);
+        damlCleanupErrors.push(`${entry.assetId}: ${msg}`);
       }
     }
 
-    return { data: { txHash: result.transactionHash, status: result.status } };
+    if (damlCleanupErrors.length > 0) {
+      console.error('[withdrawFromEscrow] Daml cleanup errors:', damlCleanupErrors);
+    }
+
+    return {
+      data: {
+        txHash: result.transactionHash,
+        status: result.status,
+        damlCleanupErrors: damlCleanupErrors.length > 0 ? damlCleanupErrors : undefined,
+      },
+    };
   },
 
-  // Withdraw a Canton-native asset (CC, CUSDC, or Canton USDC) from the vault back to the owner
-  // Works with INDIVIDUAL Daml entries (not the aggregated view) to correctly handle
-  // multiple deposits of the same asset type.
-  withdrawCantonAsset: async (vaultId: string, symbol: string, amount: number) => {
+  // Withdraw a Canton-native asset (CC, CUSDC, or Canton USDC) from the vault back to the owner.
+  // Order: custodian transfer FIRST, then Daml entry removal.
+  // This ensures vault entries are intact if the transfer fails.
+  withdrawCantonAsset: async (vaultId: string, symbol: string, amount: number, receiverUser?: string) => {
     if (!sdk) throw new Error('SDK not available');
 
     const vaults = await sdk.cantonQuery({
@@ -1207,111 +1231,117 @@ export const vaultAPI = {
       throw new Error(`Requested ${amount} ${symbol} but vault only has ${totalAvailable}`);
     }
 
-    // Step 1: Withdraw individual entries from the Daml vault to cover the requested amount.
+    // Step 1: Transfer the requested amount from custodian back to user FIRST.
+    // Do this before removing Daml entries so vault state is intact if transfer fails.
+    if (symbol === 'CC' || symbol === 'CUSDC') {
+      const withdrawRes = await fetch('/api/custodian/withdraw', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ receiverParty: owner, amount, receiverUser }),
+      });
+      const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string; accepted?: boolean };
+      if (!withdrawRes.ok || !withdrawData.success) {
+        throw new Error(`Custodian ${symbol} transfer failed: ${withdrawData.error || 'Unknown error'}`);
+      }
+      if (!withdrawData.accepted) {
+        throw new Error(`Custodian ${symbol} transfer offer created but could not be accepted — CC did not arrive in wallet. Contact support.`);
+      }
+      console.log(`[${symbol} Withdraw] Custodian transfer of ${amount} ${symbol} created and accepted`);
+    } else if (symbol === 'USDC') {
+      const withdrawRes = await fetch('/api/custodian/withdraw-usdc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ receiverParty: owner, amount }),
+      });
+      const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
+      if (!withdrawRes.ok || !withdrawData.success) {
+        throw new Error(`Canton USDC transfer failed: ${withdrawData.error || 'Unknown error'}`);
+      }
+      console.log(`[USDC Withdraw] Canton USDC transfer of ${amount} USDC created`);
+    }
+
+    // Step 2: Withdraw individual entries from the Daml vault to cover the requested amount.
     // Each WithdrawAsset removes one entry (all-or-nothing per assetId).
     // If we split a partial entry, we re-deposit the remainder.
     let remaining = amount;
+    const damlErrors: string[] = [];
     for (const entry of matchingEntries) {
       if (remaining <= 0.001) break;
 
-      // Re-query vault each iteration (contractId changes after each WithdrawAsset)
-      const freshVaults = await sdk.cantonQuery({
-        templateId: TEMPLATE_IDS.VAULT,
-        filter: { vaultId },
-      });
-      if (freshVaults.length === 0) break;
+      try {
+        // Re-query vault each iteration (contractId changes after each WithdrawAsset)
+        const freshVaults = await sdk.cantonQuery({
+          templateId: TEMPLATE_IDS.VAULT,
+          filter: { vaultId },
+        });
+        if (freshVaults.length === 0) break;
 
-      await sdk.cantonExercise({
-        contractId: freshVaults[0].contractId,
-        templateId: TEMPLATE_IDS.VAULT,
-        choice: CHOICES.WITHDRAW_ASSET,
-        argument: { assetId: entry.assetId, issuer: owner }
-      });
-      console.log(`[Canton Withdraw] Removed entry ${entry.assetId}: ${entry.amount} ${symbol}`);
+        await sdk.cantonExercise({
+          contractId: freshVaults[0].contractId,
+          templateId: TEMPLATE_IDS.VAULT,
+          choice: CHOICES.WITHDRAW_ASSET,
+          argument: { assetId: entry.assetId, issuer: owner }
+        });
+        console.log(`[Canton Withdraw] Removed entry ${entry.assetId}: ${entry.amount} ${symbol}`);
 
-      if (entry.amount > remaining + 0.001) {
-        // Partial: re-deposit the excess back into the vault
-        const excess = entry.amount - remaining;
-        const price = await getLivePrice(symbol);
-        try {
-          const newAssetId = `${symbol}-remainder-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-          const issuanceResult = await sdk.cantonCreate({
-            templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
-            payload: {
-              issuer: owner, recipient: owner,
-              assetId: newAssetId, assetType: mapAssetTypeToEnum(symbol),
-              amount: toDecimal10(excess),
-              valueUSD: toDecimal10(excess * price),
-            },
-          });
-          const acceptResult = await sdk.cantonExercise({
-            contractId: issuanceResult.contractId,
-            templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
-            choice: 'Accept',
-            argument: {},
-          });
-          const tokenCid = acceptResult.events?.find(
-            (e: { templateId: string }) => e.templateId.includes('TokenizedAsset')
-          )?.contractId;
-          if (tokenCid) {
-            const reVaults = await sdk.cantonQuery({
-              templateId: TEMPLATE_IDS.VAULT,
-              filter: { vaultId },
+        if (entry.amount > remaining + 0.001) {
+          // Partial: re-deposit the excess back into the vault
+          const excess = entry.amount - remaining;
+          const price = await getLivePrice(symbol);
+          try {
+            const newAssetId = `${symbol}-remainder-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            const issuanceResult = await sdk.cantonCreate({
+              templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+              payload: {
+                issuer: owner, recipient: owner,
+                assetId: newAssetId, assetType: mapAssetTypeToEnum(symbol),
+                amount: toDecimal10(excess),
+                valueUSD: toDecimal10(excess * price),
+              },
             });
-            if (reVaults.length > 0) {
-              await sdk.cantonExercise({
-                contractId: reVaults[0].contractId,
+            const acceptResult = await sdk.cantonExercise({
+              contractId: issuanceResult.contractId,
+              templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
+              choice: 'Accept',
+              argument: {},
+            });
+            const tokenCid = acceptResult.events?.find(
+              (e: { templateId: string }) => e.templateId.includes('TokenizedAsset')
+            )?.contractId;
+            if (tokenCid) {
+              const reVaults = await sdk.cantonQuery({
                 templateId: TEMPLATE_IDS.VAULT,
-                choice: CHOICES.DEPOSIT_ASSET,
-                argument: { assetCid: tokenCid },
+                filter: { vaultId },
               });
-              console.log(`[Canton Withdraw] Re-deposited excess: ${excess.toFixed(4)} ${symbol}`);
+              if (reVaults.length > 0) {
+                await sdk.cantonExercise({
+                  contractId: reVaults[0].contractId,
+                  templateId: TEMPLATE_IDS.VAULT,
+                  choice: CHOICES.DEPOSIT_ASSET,
+                  argument: { assetCid: tokenCid },
+                });
+                console.log(`[Canton Withdraw] Re-deposited excess: ${excess.toFixed(4)} ${symbol}`);
+              }
             }
+          } catch (err) {
+            console.warn('[Canton Withdraw] Excess re-deposit failed:', err);
+            damlErrors.push(`Re-deposit of excess ${excess.toFixed(4)} ${symbol} failed`);
           }
-        } catch (err) {
-          console.warn('[Canton Withdraw] Excess re-deposit failed:', err);
         }
-      }
 
-      remaining -= entry.amount;
-    }
-
-    // Step 2: Transfer the requested amount from custodian back to user
-    if (symbol === 'CC' || symbol === 'CUSDC') {
-      try {
-        const withdrawRes = await fetch('/api/custodian/withdraw', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ receiverParty: owner, amount }),
-        });
-        const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
-        if (!withdrawRes.ok || !withdrawData.success) {
-          console.warn(`[${symbol} Withdraw] Custodian transfer failed:`, withdrawData.error);
-        } else {
-          console.log(`[${symbol} Withdraw] Custodian transfer of ${amount} ${symbol} created`);
-        }
+        remaining -= entry.amount;
       } catch (err) {
-        console.warn(`[${symbol} Withdraw] Custodian endpoint error:`, err);
-      }
-    } else if (symbol === 'USDC') {
-      try {
-        const withdrawRes = await fetch('/api/custodian/withdraw-usdc', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ receiverParty: owner, amount }),
-        });
-        const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string };
-        if (!withdrawRes.ok || !withdrawData.success) {
-          console.warn('[USDC Withdraw] Canton USDC transfer failed:', withdrawData.error);
-        } else {
-          console.log(`[USDC Withdraw] Canton USDC transfer of ${amount} USDC created`);
-        }
-      } catch (err) {
-        console.warn('[USDC Withdraw] Canton USDC endpoint error:', err);
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[Canton Withdraw] Daml entry removal failed for ${entry.assetId}:`, err);
+        damlErrors.push(`Failed to remove entry ${entry.assetId}: ${msg}`);
       }
     }
 
-    return { success: true };
+    if (damlErrors.length > 0) {
+      console.warn('[Canton Withdraw] Daml cleanup had errors:', damlErrors);
+    }
+
+    return { success: true, damlErrors: damlErrors.length > 0 ? damlErrors : undefined };
   },
 
   // Close a vault — archive the Daml contract
@@ -1998,6 +2028,7 @@ export interface BrokerFundLinkData {
   operator: string;
   linkId: string;
   ltvThreshold: number;
+  leverageRatio: number;
   isActive: boolean;
   linkedAt: string;
   allowedAssets: string[];
@@ -2049,6 +2080,7 @@ export const linkAPI = {
           data: contracts.map((c) => {
             const p = c.payload as Record<string, unknown>;
             const rawThreshold = p.ltvThreshold;
+            const rawLeverage = p.leverageRatio;
             console.log('[linkAPI] BrokerFundLink payload allowedAssets:', JSON.stringify(p.allowedAssets));
             return {
               contractId: c.contractId,
@@ -2057,6 +2089,7 @@ export const linkAPI = {
               operator: p.operator as string,
               linkId: p.linkId as string,
               ltvThreshold: typeof rawThreshold === 'string' ? parseFloat(rawThreshold) : (rawThreshold as number) || 0.8,
+              leverageRatio: rawLeverage != null ? (typeof rawLeverage === 'string' ? parseFloat(rawLeverage) : (rawLeverage as number)) : 1,
               isActive: p.isActive as boolean,
               linkedAt: p.linkedAt as string,
               allowedAssets: parseOptionalTextList(p.allowedAssets),
@@ -2082,6 +2115,7 @@ export const linkAPI = {
           data: contracts.map((c) => {
             const p = c.payload as Record<string, unknown>;
             const rawThreshold = p.ltvThreshold;
+            const rawLeverage = p.leverageRatio;
             console.log('[linkAPI] BrokerFundLink payload for fund allowedAssets:', JSON.stringify(p.allowedAssets));
             return {
               contractId: c.contractId,
@@ -2090,6 +2124,7 @@ export const linkAPI = {
               operator: p.operator as string,
               linkId: p.linkId as string,
               ltvThreshold: typeof rawThreshold === 'string' ? parseFloat(rawThreshold) : (rawThreshold as number) || 0.8,
+              leverageRatio: rawLeverage != null ? (typeof rawLeverage === 'string' ? parseFloat(rawLeverage) : (rawLeverage as number)) : 1,
               isActive: p.isActive as boolean,
               linkedAt: p.linkedAt as string,
               allowedAssets: parseOptionalTextList(p.allowedAssets),
@@ -2202,13 +2237,17 @@ export interface LTVChangeProposalData {
   operator: string;
   linkContractId: string;
   proposedThreshold: number;
+  proposedLeverage: number | null;
   currentThreshold: number;
+  currentLeverage: number | null;
   proposalId: string;
   createdAt: string;
 }
 
 function contractToProposal(c: CantonContract<Record<string, unknown>>): LTVChangeProposalData {
   const p = c.payload as Record<string, unknown>;
+  const rawProposedLev = p.proposedLeverage;
+  const rawCurrentLev = p.currentLeverage;
   return {
     contractId: c.contractId,
     broker: p.broker as string,
@@ -2216,14 +2255,16 @@ function contractToProposal(c: CantonContract<Record<string, unknown>>): LTVChan
     operator: p.operator as string,
     linkContractId: p.linkContractId as string,
     proposedThreshold: typeof p.proposedThreshold === 'string' ? parseFloat(p.proposedThreshold) : (p.proposedThreshold as number) || 0,
+    proposedLeverage: rawProposedLev != null ? (typeof rawProposedLev === 'string' ? parseFloat(rawProposedLev) : (rawProposedLev as number)) : null,
     currentThreshold: typeof p.currentThreshold === 'string' ? parseFloat(p.currentThreshold) : (p.currentThreshold as number) || 0,
+    currentLeverage: rawCurrentLev != null ? (typeof rawCurrentLev === 'string' ? parseFloat(rawCurrentLev) : (rawCurrentLev as number)) : null,
     proposalId: p.proposalId as string,
     createdAt: p.createdAt as string,
   };
 }
 
 export const proposalAPI = {
-  propose: async (linkContractId: string, proposedThreshold: number, _currentThreshold: number) => {
+  propose: async (linkContractId: string, proposedThreshold: number, _currentThreshold: number, proposedLeverage?: number) => {
     if (sdk) {
       try {
         const proposalId = `LTV-${Date.now()}`;
@@ -2233,6 +2274,7 @@ export const proposalAPI = {
           choice: CHOICES.PROPOSE_LTV_CHANGE,
           argument: {
             proposedThreshold: toDecimal10(proposedThreshold),
+            proposedLeverage: proposedLeverage != null ? toDecimal10(proposedLeverage) : null,
             proposalId,
             proposalCreatedAt: new Date().toISOString(),
           },
@@ -2491,7 +2533,22 @@ async function recalcPositionsLive(positions: PositionData[]): Promise<PositionD
     vaultAgg[pos.vaultId].totalPnL += pos.unrealizedPnL;
   }
 
-  // Recalc collateralValue and LTV
+  // Fetch broker-fund links to get per-link leverage ratio
+  const brokerFundPairs = [...new Set(positions.map(p => `${p.broker}|${p.fund}`))];
+  const linkLeverageMap: Record<string, number> = {};
+  for (const pair of brokerFundPairs) {
+    const [broker, fund] = pair.split('|');
+    try {
+      const linkContracts = await sdk.cantonQuery({ templateId: TEMPLATE_IDS.BROKER_FUND_LINK, filter: { broker, fund } });
+      if (linkContracts.length > 0) {
+        const lp = linkContracts[0].payload as Record<string, unknown>;
+        const rawLev = lp.leverageRatio;
+        linkLeverageMap[pair] = rawLev != null ? (typeof rawLev === 'string' ? parseFloat(rawLev) : (rawLev as number)) || 1 : 1;
+      }
+    } catch { /* default to 1 */ }
+  }
+
+  // Recalc collateralValue and LTV (leverage-aware)
   const result = withPnL.map(pos => {
     const collateral = vaultValues[pos.vaultId];
     // If vault wasn't visible (e.g. broker can't see fund's vault), keep on-ledger LTV
@@ -2501,7 +2558,8 @@ async function recalcPositionsLive(positions: PositionData[]): Promise<PositionD
     const agg = vaultAgg[pos.vaultId];
     const effectiveCollateral = collateral + (agg?.totalPnL || 0);
     const totalNotional = agg?.totalNotional || pos.notionalValue;
-    const ltv = effectiveCollateral > 0 ? totalNotional / effectiveCollateral : (totalNotional > 0 ? 999 : 0);
+    const leverage = linkLeverageMap[`${pos.broker}|${pos.fund}`] || 1;
+    const ltv = effectiveCollateral > 0 ? totalNotional / (effectiveCollateral * leverage) : (totalNotional > 0 ? 999 : 0);
     return { ...pos, collateralValue: collateral, currentLTV: ltv };
   });
 
@@ -2541,11 +2599,14 @@ async function recalcPositionsLive(positions: PositionData[]): Promise<PositionD
           const totalNotional = agg?.totalNotional || 0;
           if (totalNotional <= 0) continue;
 
-          // Generate ZK proof attesting raw collateral sufficiency
+          // Use per-link leverage to scale the ZK threshold
+          const refPos = vPositions[0];
+          const zkLeverage = linkLeverageMap[`${refPos.broker}|${refPos.fund}`] || 1;
+          // Scale collateral by leverage for ZK proof: proves collateral * leverage >= notional at threshold
           const zkResult = await generateLTVProof({
-            assetValuesCents: [usdToCents(collateral)],
+            assetValuesCents: [usdToCents(collateral * zkLeverage)],
             notionalValueCents: usdToCents(totalNotional),
-            ltvThresholdBps: 8000, // 80% standard threshold
+            ltvThresholdBps: 8000, // 80% standard threshold (leverage already factored into collateral)
           });
 
           const hash = await computeProofHash(zkResult.proof);

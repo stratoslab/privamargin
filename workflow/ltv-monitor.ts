@@ -23,7 +23,9 @@ interface Env extends LiquidationEnv {
   CANTON_AUTH_TOKEN: string;
   OPERATOR_PARTY: string;
   PACKAGE_ID: string;
-  COINMARKETCAP_API_KEY: string;
+  COINMARKETCAP_API_KEY?: string; // deprecated — now uses CoinGecko
+  USDC_TEMPLATE_ID?: string;
+  SPLICE_ADMIN_USER?: string;
   PRIVAMARGIN_CONFIG: KVNamespace;
   LTV_MONITOR_WORKFLOW: Workflow;
 }
@@ -74,6 +76,7 @@ interface LinkContract {
     operator: string;
     linkId: string;
     ltvThreshold: string;
+    leverageRatio: string | null;
     isActive: boolean;
     linkedAt: string;
   };
@@ -151,16 +154,16 @@ async function cantonExercise(env: Env, contractId: string, templateId: string, 
   return await response.json();
 }
 
-// CoinMarketCap price fetching
-const CMC_IDS: Record<string, number> = {
-  CC: 37263,
-  BTC: 1,
-  ETH: 1027,
-  SOL: 5426,
-  USDC: 3408,
-  USDT: 825,
-  TRX: 1958,
-  TON: 11419,
+// CoinGecko ID mapping (matches frontend api.ts)
+const COINGECKO_IDS: Record<string, string> = {
+  BTC: 'bitcoin',
+  ETH: 'ethereum',
+  SOL: 'solana',
+  CC: 'canton-network',
+  USDC: 'usd-coin',
+  USDT: 'tether',
+  TRX: 'tron',
+  TON: 'the-open-network',
 };
 
 const FALLBACK_PRICES: Record<string, number> = {
@@ -185,7 +188,7 @@ function extractAssetSymbol(description: string): string | null {
   const parts = description.trim().split(/\s+/);
   // Last word is typically the symbol
   const symbol = parts[parts.length - 1];
-  return symbol && CMC_IDS[symbol] ? symbol : null;
+  return symbol && COINGECKO_IDS[symbol] ? symbol : null;
 }
 
 // Calculate unrealized PnL for a position given current price
@@ -203,39 +206,26 @@ function calculatePnL(
   return units * (currentPrice - entryPrice);
 }
 
-async function fetchLivePrices(apiKey: string): Promise<Record<string, number>> {
+async function fetchLivePrices(): Promise<Record<string, number>> {
   const prices = { ...FALLBACK_PRICES };
 
-  if (!apiKey) return prices;
-
   try {
-    const ids = Object.values(CMC_IDS).join(',');
+    const ids = Object.values(COINGECKO_IDS).join(',');
     const response = await fetch(
-      `https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest?id=${ids}`,
-      {
-        headers: {
-          'X-CMC_PRO_API_KEY': apiKey,
-          'Accept': 'application/json',
-        },
-      }
+      `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`
     );
 
     if (response.ok) {
-      const data = await response.json() as {
-        data?: Record<string, { quote?: { USD?: { price?: number } } }>
-      };
+      const data = await response.json() as Record<string, { usd?: number }>;
 
-      if (data.data) {
-        for (const [symbol, cmcId] of Object.entries(CMC_IDS)) {
-          const assetData = data.data[cmcId.toString()];
-          if (assetData?.quote?.USD?.price) {
-            prices[symbol] = assetData.quote.USD.price;
-          }
+      for (const [symbol, geckoId] of Object.entries(COINGECKO_IDS)) {
+        if (data[geckoId]?.usd) {
+          prices[symbol] = data[geckoId].usd;
         }
       }
     }
   } catch (err) {
-    console.error('Failed to fetch CMC prices:', err);
+    console.error('Failed to fetch CoinGecko prices:', err);
   }
 
   return prices;
@@ -274,10 +264,14 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
     const LINK_TEMPLATE = `${pkgId}:BrokerFundLink:BrokerFundLink`;
     const WORKFLOW_MC_TEMPLATE = `${pkgId}:MarginVerification:WorkflowMarginCall`;
 
-    // Step 1: Fetch all open positions
+    // Step 1: Fetch all open and margin-called positions
     const positions = await step.do('fetch-positions', async () => {
-      const results = await cantonQuery(env, POSITION_TEMPLATE, { status: 'Open' });
-      console.log(`Found ${results.length} open positions`);
+      const [openResults, mcResults] = await Promise.all([
+        cantonQuery(env, POSITION_TEMPLATE, { status: 'Open' }),
+        cantonQuery(env, POSITION_TEMPLATE, { status: 'MarginCalled' }),
+      ]);
+      const results = [...openResults, ...mcResults];
+      console.log(`Found ${results.length} positions (${openResults.length} open, ${mcResults.length} margin-called)`);
       return results as PositionContract[];
     });
 
@@ -302,7 +296,7 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
         const indexRaw = await env.PRIVAMARGIN_CONFIG.get('workflow:runs:index');
         const index: string[] = indexRaw ? JSON.parse(indexRaw) : [];
         index.push(emptyTimestamp);
-        if (index.length > 100) index.splice(0, index.length - 100);
+        if (index.length > 20) index.splice(0, index.length - 20);
         await env.PRIVAMARGIN_CONFIG.put('workflow:runs:index', JSON.stringify(index));
         console.log(`Persisted empty run record: ${emptyTimestamp}`);
       });
@@ -327,12 +321,36 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
 
     // Step 3: Fetch live prices
     const prices = await step.do('fetch-live-prices', async () => {
-      return await fetchLivePrices(env.COINMARKETCAP_API_KEY);
+      return await fetchLivePrices();
     });
 
-    // Step 4: Compute PnL and LTVs
+    // Step 4: Fetch LTV thresholds and leverage ratios from BrokerFundLink
+    const brokerFundPairs = [...new Set(positions.map(p => `${p.payload.broker}|${p.payload.fund}`))];
+
+    const linkData = await step.do('fetch-thresholds', async () => {
+      const thresholdMap: Record<string, number> = {};
+      const leverageMap: Record<string, number> = {};
+      for (const pair of brokerFundPairs) {
+        const [broker, fund] = pair.split('|');
+        const results = await cantonQuery(env, LINK_TEMPLATE, { broker, fund });
+        if (results.length > 0) {
+          const link = results[0] as LinkContract;
+          thresholdMap[pair] = parseFloat(link.payload.ltvThreshold) || 0.8;
+          leverageMap[pair] = link.payload.leverageRatio != null ? (parseFloat(link.payload.leverageRatio) || 1) : 1;
+        } else {
+          thresholdMap[pair] = 0.8;
+          leverageMap[pair] = 1;
+        }
+      }
+      return { thresholdMap, leverageMap };
+    });
+
+    const thresholds = linkData.thresholdMap;
+    const leverages = linkData.leverageMap;
+
+    // Step 5: Compute PnL and LTVs (leverage-aware)
     //   PnL: Long = units * (currentPrice - entryPrice), Short = reverse
-    //   LTV: totalNotional / (collateral + totalPnL)
+    //   LTV: totalNotional / (effectiveCollateral * leverageRatio)
     //   Multiple positions on one vault share the collateral, so we aggregate.
     const ltvResults = await step.do('compute-ltvs', async () => {
       // Pre-compute per-position PnL
@@ -367,9 +385,11 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
 
         // Effective collateral = vault collateral + aggregate PnL of all positions on this vault
         const effectiveCollateral = collateralValue + (agg?.totalPnL || 0);
-        // LTV = aggregate notional / effective collateral (same for all positions on this vault)
+        // LTV = aggregate notional / (effective collateral * leverage)
         const totalNotional = agg?.totalNotional || notional;
-        const ltv = effectiveCollateral > 0 ? totalNotional / effectiveCollateral : (totalNotional > 0 ? Infinity : 0);
+        const pairKey = `${pos.payload.broker}|${pos.payload.fund}`;
+        const leverageRatio = leverages[pairKey] || 1;
+        const ltv = effectiveCollateral > 0 ? totalNotional / (effectiveCollateral * leverageRatio) : (totalNotional > 0 ? Infinity : 0);
 
         return {
           contractId: pos.contractId,
@@ -378,30 +398,13 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
           fund: pos.payload.fund,
           broker: pos.payload.broker,
           operator: pos.payload.operator,
+          status: pos.payload.status,
           notional,
           collateralValue,
           pnl,
           currentLTV: ltv === Infinity ? 999 : ltv,
         };
       });
-    });
-
-    // Step 5: Fetch LTV thresholds from BrokerFundLink
-    const brokerFundPairs = [...new Set(positions.map(p => `${p.payload.broker}|${p.payload.fund}`))];
-
-    const thresholds = await step.do('fetch-thresholds', async () => {
-      const thresholdMap: Record<string, number> = {};
-      for (const pair of brokerFundPairs) {
-        const [broker, fund] = pair.split('|');
-        const results = await cantonQuery(env, LINK_TEMPLATE, { broker, fund });
-        if (results.length > 0) {
-          const link = results[0] as LinkContract;
-          thresholdMap[pair] = parseFloat(link.payload.ltvThreshold) || 0.8;
-        } else {
-          thresholdMap[pair] = 0.8;
-        }
-      }
-      return thresholdMap;
     });
 
     // Step 5b: Fetch auto-liquidate preferences from KV
@@ -415,8 +418,14 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
       return flagMap;
     });
 
+    // Step 5c: Fetch custodian party from KV (for Canton USDC transfers during liquidation)
+    const custodianParty = await step.do('fetch-custodian-party', async () => {
+      return await env.PRIVAMARGIN_CONFIG.get('custodianParty') || '';
+    });
+
     // Step 6: Create margin calls for breaches
     let marginCallsCreated = 0;
+    const liquidatedPositionIds = new Set<string>();
 
     for (const result of ltvResults) {
       const pairKey = `${result.broker}|${result.fund}`;
@@ -425,41 +434,52 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
       if (result.currentLTV >= threshold) {
         try {
           await step.do(`margin-call-${result.positionId}`, async () => {
-            // Create WorkflowMarginCall
-            const requiredAmount = result.notional - (result.collateralValue * threshold);
-            await cantonCreate(env, WORKFLOW_MC_TEMPLATE, {
-              operator: env.OPERATOR_PARTY,
-              fund: result.fund,
-              broker: result.broker,
-              positionId: result.positionId,
-              vaultId: result.vaultId,
-              requiredAmount: requiredAmount.toString(),
-              currentLTV: result.currentLTV.toString(),
-              ltvThreshold: threshold.toString(),
-              callTime: new Date().toISOString(),
-              status: 'WMCActive',
-            });
+            const leverageRatio = leverages[pairKey] || 1;
+            const requiredAmount = result.notional - (result.collateralValue * leverageRatio * threshold);
+            let currentContractId = result.contractId;
+            const alreadyMarginCalled = result.status === 'MarginCalled';
 
-            // Mark position as margin called
-            await cantonExercise(
-              env,
-              result.contractId,
-              POSITION_TEMPLATE,
-              'MarkMarginCalled',
-              {}
-            );
+            if (!alreadyMarginCalled) {
+              // Create WorkflowMarginCall
+              await cantonCreate(env, WORKFLOW_MC_TEMPLATE, {
+                operator: env.OPERATOR_PARTY,
+                fund: result.fund,
+                broker: result.broker,
+                positionId: result.positionId,
+                vaultId: result.vaultId,
+                requiredAmount: requiredAmount.toString(),
+                currentLTV: result.currentLTV.toString(),
+                ltvThreshold: threshold.toString(),
+                callTime: new Date().toISOString(),
+                status: 'WMCActive',
+              });
+
+              // Mark position as margin called
+              const mcResult = await cantonExercise(
+                env,
+                result.contractId,
+                POSITION_TEMPLATE,
+                'MarkMarginCalled',
+                {}
+              );
+              // MarkMarginCalled archives old contract — use new contract ID
+              if (mcResult?.result?.exerciseResult) {
+                currentContractId = mcResult.result.exerciseResult;
+              }
+            }
 
             // Auto-liquidate if enabled for this broker-fund pair (from KV)
             if (autoLiqFlags[pairKey]) {
               const vault = vaults[result.vaultId];
               let liquidatedAmount = requiredAmount;
+              let seizedVaultAssets: Array<{ assetId: string; amount: number }> = [];
 
               if (vault && env.DEPLOYER_PRIVATE_KEY && env.CANTON_AUTH_SECRET) {
                 try {
                   const liqResult = await executeLiquidation({
                     env,
                     position: {
-                      contractId: result.contractId,
+                      contractId: currentContractId,
                       positionId: result.positionId,
                       vaultId: result.vaultId,
                       fund: result.fund,
@@ -472,11 +492,14 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
                     vault,
                     prices,
                     threshold,
+                    custodianParty,
                   });
 
                   if (liqResult.totalSeizedUSD > 0) {
                     liquidatedAmount = liqResult.totalSeizedUSD;
                   }
+
+                  seizedVaultAssets = liqResult.seizedVaultAssets;
 
                   console.log(`[Auto-Liquidation] Position ${result.positionId}: seized $${liqResult.totalSeizedUSD.toFixed(2)}, ` +
                     `escrow: ${liqResult.escrowSeizures.length}, canton: ${liqResult.cantonSeizures.length}, errors: ${liqResult.errors.length}`);
@@ -491,12 +514,43 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
                 console.log(`[Auto-Liquidation] Skipping seizure for ${result.positionId}: missing DEPLOYER_PRIVATE_KEY or CANTON_AUTH_SECRET`);
               }
 
+              // Exercise SeizeCollateral on the vault for each seized asset
+              if (seizedVaultAssets.length > 0) {
+                const freshVaults = await cantonQuery(env, VAULT_TEMPLATE, { vaultId: result.vaultId });
+                let vaultCid = freshVaults[0]?.contractId;
+                if (vaultCid) {
+                  for (const seized of seizedVaultAssets) {
+                    try {
+                      const seizeResult = await cantonExercise(env, vaultCid, VAULT_TEMPLATE, 'SeizeCollateral', {
+                        assetId: seized.assetId,
+                        seizeAmount: seized.amount.toString(),
+                        reason: `Auto-liquidation of position ${result.positionId}`,
+                      });
+                      // SeizeCollateral archives old contract — use new contractId
+                      if (seizeResult?.result?.exerciseResult) {
+                        vaultCid = seizeResult.result.exerciseResult;
+                      }
+                    } catch (err) {
+                      console.error(`[Auto-Liquidation] SeizeCollateral failed for ${seized.assetId}:`, err);
+                    }
+                  }
+                }
+              }
+
+              // Resolve closing price for this position's asset
+              const posDesc = positions.find(p => p.contractId === result.contractId)?.payload.description || '';
+              const assetSym = extractAssetSymbol(posDesc);
+              const closingPrice = assetSym ? (prices[assetSym] || 0) : 0;
+
               // Always exercise LiquidatePosition on Canton (even if seizure partially failed)
-              await cantonExercise(env, result.contractId, POSITION_TEMPLATE, 'LiquidatePosition', {
+              await cantonExercise(env, currentContractId, POSITION_TEMPLATE, 'LiquidatePosition', {
                 ltvThreshold: threshold.toString(),
                 liquidatedAmount: liquidatedAmount.toString(),
                 liquidatedAt: new Date().toISOString(),
+                finalPnL: result.pnl.toString(),
+                exitPrice: closingPrice > 0 ? closingPrice.toString() : null,
               });
+              liquidatedPositionIds.add(result.positionId);
               console.log(`Auto-liquidated position ${result.positionId}: LTV ${(result.currentLTV * 100).toFixed(1)}% >= ${(threshold * 100).toFixed(0)}%, amount: $${liquidatedAmount.toFixed(2)}`);
             }
 
@@ -509,27 +563,35 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
       }
     }
 
-    // Step 7: Update all position LTVs
+    // Step 7: Update LTVs for all positions that weren't liquidated in this run.
+    // Positions that were margin-called (new or existing) still need their on-ledger LTV refreshed.
+    // Note: MarkMarginCalled archives the old contract, so for newly margin-called positions
+    // we must re-query to get the current contract ID.
     for (const result of ltvResults) {
-      if (result.currentLTV < (thresholds[`${result.broker}|${result.fund}`] || 0.8)) {
-        // Only update non-breached positions (breached ones were already updated via MarkMarginCalled)
-        try {
-          await step.do(`update-ltv-${result.positionId}`, async () => {
-            await cantonExercise(
-              env,
-              result.contractId,
-              POSITION_TEMPLATE,
-              'UpdateLTV',
-              {
-                newLTV: result.currentLTV.toString(),
-                checkedAt: new Date().toISOString(),
-                newPnL: result.pnl.toString(),
-              }
-            );
-          });
-        } catch (err) {
-          console.error(`Failed to update LTV for ${result.positionId}:`, err);
-        }
+      if (liquidatedPositionIds.has(result.positionId)) continue;
+      try {
+        await step.do(`update-ltv-${result.positionId}`, async () => {
+          // Re-query to get the current contract ID (may have changed due to MarkMarginCalled)
+          const current = await cantonQuery(env, POSITION_TEMPLATE, { positionId: result.positionId });
+          const activeContract = current.find((c: PositionContract) =>
+            c.payload.status === 'Open' || c.payload.status === 'MarginCalled'
+          );
+          if (!activeContract) return;
+
+          await cantonExercise(
+            env,
+            activeContract.contractId,
+            POSITION_TEMPLATE,
+            'UpdateLTV',
+            {
+              newLTV: result.currentLTV.toString(),
+              checkedAt: new Date().toISOString(),
+              newPnL: result.pnl.toString(),
+            }
+          );
+        });
+      } catch (err) {
+        console.error(`Failed to update LTV for ${result.positionId}:`, err);
       }
     }
 
@@ -577,7 +639,7 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
         { expirationTtl: 30 * 24 * 60 * 60 }
       );
 
-      // Maintain rolling index of last 100 timestamps
+      // Maintain rolling index of last 20 timestamps
       const indexRaw = await env.PRIVAMARGIN_CONFIG.get('workflow:runs:index');
       const index: string[] = indexRaw ? JSON.parse(indexRaw) : [];
       index.push(summary.timestamp);
@@ -601,6 +663,22 @@ export class LTVMonitorWorkflow extends WorkflowEntrypoint<Env, {}> {
 export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     console.log('LTV Monitor scheduled check triggered');
+
+    // KV-gated interval: only run if enough time has elapsed since last scheduled run
+    const intervalRaw = await env.PRIVAMARGIN_CONFIG.get('workflow:check_interval');
+    const intervalMinutes = intervalRaw ? parseInt(intervalRaw, 10) : 15;
+    const lastScheduled = await env.PRIVAMARGIN_CONFIG.get('workflow:last_scheduled');
+    if (lastScheduled) {
+      const elapsed = Date.now() - parseInt(lastScheduled, 10);
+      if (elapsed < intervalMinutes * 60 * 1000) {
+        console.log(`Skipping: only ${Math.round(elapsed / 1000)}s since last scheduled (interval: ${intervalMinutes}m)`);
+        return;
+      }
+    }
+
+    // Write timestamp BEFORE creating workflow to prevent duplicates from the next cron tick
+    await env.PRIVAMARGIN_CONFIG.put('workflow:last_scheduled', String(Date.now()));
+
     const instance = await env.LTV_MONITOR_WORKFLOW.create();
     console.log(`Started workflow instance: ${instance.id}`);
   },

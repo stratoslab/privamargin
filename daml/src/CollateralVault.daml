@@ -121,6 +121,25 @@ template CollateralVault
         let totalValue = foldl (\acc pos -> acc + pos.valueUSD) 0.0 collateralAssets
         return (totalValue, length collateralAssets)
 
+    choice SeizeCollateral: ContractId CollateralVault
+      with
+        assetId: Text
+        seizeAmount: Decimal
+        reason: Text
+      controller operator
+      do
+        let updatedAssets = map (\pos ->
+              if pos.assetId == assetId
+              then pos with
+                amount = pos.amount - seizeAmount
+                valueUSD = if pos.amount > 0.0
+                           then pos.valueUSD * ((pos.amount - seizeAmount) / pos.amount)
+                           else 0.0
+              else pos
+              ) collateralAssets
+        let filteredAssets = filter (\pos -> pos.amount > 0.001) updatedAssets
+        create this with collateralAssets = filteredAssets
+
     choice CloseVault: ()
       controller owner
       do
