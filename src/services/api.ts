@@ -2672,16 +2672,6 @@ export const positionAPI = {
   ) => {
     if (sdk) {
       try {
-        // Guard: reject position creation if entry price came from stale fallback
-        if (entryPrice > 0 && !arePricesFresh()) {
-          // Force a fresh fetch (cache might be stale)
-          livePriceCacheTime = 0;
-          await fetchLivePrices();
-          if (!arePricesFresh()) {
-            throw new Error('Cannot create position: unable to fetch live market price. Please try again.');
-          }
-        }
-
         // Get vault value with live prices for initial LTV calculation
         let collateralValue = 0;
         try {
@@ -3232,13 +3222,18 @@ export const positionAPI = {
 
       if (seizedVaultAssets.length > 0) {
         try {
-          const seizeOperator = await getOperatorParty();
-          const seizeActAs = seizeOperator ? [seizeOperator] : [];
+          // Read the vault's actual operator party (may be custodian, not the config operator)
           const freshVaults = await sdk.cantonQuery({
             templateId: TEMPLATE_IDS.VAULT,
             filter: { vaultId: pos.vaultId },
           });
           let vaultCid = freshVaults[0]?.contractId;
+          const vaultOperator = freshVaults[0]
+            ? (freshVaults[0].payload as Record<string, unknown>).operator as string
+            : null;
+          // Fallback chain: vault operator → custodian → config operator
+          const seizeParty = vaultOperator || await getCustodianParty() || await getOperatorParty();
+          const seizeActAs = seizeParty ? [seizeParty] : [];
 
           if (vaultCid) {
             for (const seized of seizedVaultAssets) {
@@ -3291,10 +3286,8 @@ export const positionAPI = {
     // 11. Snapshot PnL, then exercise LiquidatePosition on Canton
     //     LiquidatePosition has `controller operator` so we must include the
     //     operator party in actAs even when the broker initiates the call.
-    //     The contract ID can go stale at any point (workflow races), so we
-    //     re-resolve before each exercise.
-    const operatorParty = await getOperatorParty();
-    const actAsParties = operatorParty ? [operatorParty] : [];
+    //     Use the position's actual operator (may differ from config operator).
+    const actAsParties = pos.operator ? [pos.operator] : [];
 
     // Helper: resolve the current active contract ID for this positionId
     const resolveCurrentCid = async (): Promise<string> => {
