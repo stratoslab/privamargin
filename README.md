@@ -4,6 +4,10 @@ Privacy-preserving prime brokerage margin management on Canton Network.
 
 PrivaMargin enables hedge funds to prove margin sufficiency to prime brokers using zero-knowledge proofs — brokers verify collateral adequacy without seeing individual asset values. Collateral lives in self-custodied EVM escrow contracts and Canton-native vaults, with proportional liquidation that seizes only what's owed.
 
+### Demo
+
+[![PrivaMargin Demo](https://img.youtube.com/vi/ex3KanbFG1s/maxresdefault.jpg)](https://youtu.be/ex3KanbFG1s)
+
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
