@@ -1003,57 +1003,148 @@ Network mode is controlled by `VITE_NETWORK_MODE` environment variable (`testnet
 
 ---
 
-## Build & Deploy
+## Setup Guide
 
-### Prerequisites
+### Overview
+
+PrivaMargin runs as a mini-app inside a Stratos Wallet portal. The portal handles user authentication (WebAuthn passkeys), multi-chain key management, and Canton SDK bridging. PrivaMargin runs in an iframe and communicates with Canton via the portal's SDK (`@stratos-wallet/sdk`).
+
+```
+┌──────────────────────────────────────────┐
+│  Stratos Wallet Portal (parent window)   │
+│  - WebAuthn auth, multi-chain keys       │
+│  - Canton JSON API proxy (JWT)           │
+│  - Dock: Trade | RWA | Vault | PrivaMargin│
+├──────────────────────────────────────────┤
+│  PrivaMargin (iframe)                    │
+│  - Positions, Vaults, ZK Proofs          │
+│  - SDK postMessage → Portal → Canton     │
+└──────────────────────────────────────────┘
+```
+
+### Step 1: Install the Stratos Wallet Portal
+
+The portal is created from the `stratos-init` base project using the interactive setup wizard.
+
+```bash
+cd stratos-init
+./scripts/init-instance.sh
+```
+
+The wizard prompts for:
+- **Instance name** — e.g. `wallet-privamargin` (becomes the Cloudflare project name)
+- **Organization name** — displayed in the portal UI
+- **Theme** — purple, teal, blue, orange, green, rose, or slate
+- **WebAuthn RP ID** — your domain (e.g. `n1.cantondefi.com`)
+- **Canton connection** — Splice host, JSON API host, auth credentials
+- **Superadmin credentials** — username/password for the admin panel
+
+The script creates a new directory (e.g. `../wallet-privamargin/`), provisions a Cloudflare D1 database, applies the schema, seeds default assets and RPC endpoints, and installs dependencies.
+
+### Step 2: Deploy the Portal
+
+```bash
+cd ../wallet-privamargin
+npm run build
+npm run deploy
+```
+
+The portal is now live at your configured domain (e.g. `https://n1.cantondefi.com`).
+
+### Step 3: Register PrivaMargin as a Mini-App
+
+Login to the portal's admin panel at `/admin` and add PrivaMargin to the app dock.
+
+**Via the admin UI:**
+1. Navigate to the **Apps** section
+2. Click **Add App**
+3. Fill in:
+   - **ID**: `privamargin`
+   - **Name**: `PrivaMargin`
+   - **Icon**: `📊` (or any emoji/character)
+   - **Color**: `#6366f1`
+   - **URL**: `https://stratos-privamargin.pages.dev` (or your deployment URL)
+   - **Sort Order**: position in the dock (e.g. `3`)
+   - **Enabled**: Yes
+4. Save
+
+**Via the API:**
+```bash
+curl -X POST https://n1.cantondefi.com/api/superadmin/apps \
+  -H "Content-Type: application/json" \
+  -H "Cookie: <admin-session>" \
+  -d '{
+    "id": "privamargin",
+    "name": "PrivaMargin",
+    "icon": "📊",
+    "color": "#6366f1",
+    "url": "https://stratos-privamargin.pages.dev",
+    "sort_order": 3,
+    "is_enabled": true
+  }'
+```
+
+PrivaMargin now appears in the portal dock. Users click it to open in an iframe with full SDK access.
+
+### Step 4: Create User Accounts
+
+Each participant (fund, broker, operator) needs a portal account. Users register via WebAuthn passkey at the portal login page. The portal assigns each user a Canton party ID.
+
+For the **operator** role, assign via the PrivaMargin admin page (`/admin` within PrivaMargin) after logging in with the operator's account.
+
+### Step 5: Build and Deploy PrivaMargin
+
+#### Prerequisites
 
 - Node.js 18+
 - Daml SDK 3.4.9 (for DAR compilation)
-- Cloudflare account with Wrangler CLI (for deployment)
+- Cloudflare account with Wrangler CLI
 - `@stratos-wallet/sdk` (local linked package at `../stratos-wallet-sdk`)
 
-### Install Dependencies
+#### Install Dependencies
 
 ```bash
+cd stratos-privamargin
 npm install
 ```
 
-### Build Daml Package
+#### Build Daml Package
 
 ```bash
 npm run build:dar
 ```
 
-Compiles Daml sources in `daml/src/`, updates `PACKAGE_ID` in `wrangler.toml` to the new DAR hash, and copies the DAR file to `public/package.dar`.
+Compiles Daml sources in `daml/src/`, updates `PACKAGE_ID` in `wrangler.toml` to the new DAR hash, and copies the DAR to `public/package.dar`.
 
-### Deploy DAR to Canton
+#### Deploy DAR to Canton
 
-After building the DAR, upload it to all Canton participant nodes. The portal UI at each participant provides a DAR upload page:
+Upload the DAR to all Canton participant nodes:
 
-1. Open the Canton participant portal (e.g. `https://p1.cantondefi.com`, `https://p2.cantondefi.com`)
+1. Open the portal admin at each participant (e.g. `https://n1.cantondefi.com/admin`)
 2. Navigate to the DAR upload / package management section
 3. Upload `daml/.daml/dist/privamargin6-0.1.0.dar`
-4. Repeat for each participant node that needs the updated contracts
+4. Repeat for each participant node
 
-The new package must be deployed to all participants before the frontend or workflow can use the updated templates and choices (e.g. `AttestCollateral`).
+The new package must be deployed to all participants before the frontend can use the updated templates.
 
-### Build ZK Circuit (optional — artifacts may be pre-built)
+#### Update Package ID
+
+After deploying the DAR, update the package ID in:
+- `wrangler.toml` → `PACKAGE_ID` (auto-updated by `build:dar`)
+- `src/services/api.ts` → `CPCV_PACKAGE_ID` (hardcoded, must match)
+- `workflow/wrangler.toml` → `PACKAGE_ID` (if using the workflow worker)
+
+All three must be the same hash.
+
+#### Build ZK Circuit (optional — artifacts may be pre-built)
 
 ```bash
 npm run build:zk
 ```
 
-Requires `circom2` (installed via npm devDependencies). Runs the full trusted setup ceremony and outputs WASM, zkey, and verification key to `public/zk/`.
+Requires `circom2`. Runs the trusted setup ceremony and outputs WASM, zkey, and verification key to `public/zk/`.
 
-### Development Server
-
-```bash
-npm run dev
-```
-
-Starts Vite dev server on port 5175.
-
-### Production Build
+#### Build Frontend
 
 ```bash
 npm run build
@@ -1061,18 +1152,48 @@ npm run build
 
 Runs `copy-dar` → TypeScript compilation → Vite build. Output in `dist/`.
 
-### Deploy to Cloudflare Pages
+#### Deploy to Cloudflare Pages
 
 ```bash
-npm run deploy
+npx wrangler pages deploy dist --project-name=stratos-privamargin --branch=production --commit-dirty=true
 ```
 
-Requires Cloudflare Wrangler authentication. Set secrets:
+Set secrets (one-time):
 
 ```bash
 wrangler pages secret put DEPLOYER_PRIVATE_KEY   # Hex-encoded EOA private key for escrow deployment
 wrangler pages secret put API_SECRET              # Shared secret for cross-origin API auth
 ```
+
+### Step 6: Configure PrivaMargin
+
+After deploying, open PrivaMargin from the portal dock as the **operator** user.
+
+1. **Assign roles** — Go to Admin page, assign broker and fund roles to registered users
+2. **Provision custodian** — Click "Provision Custodian" to create the headless vault-custodian party on Canton
+3. **Configure deployer** — Set the EVM deployer address for escrow contract deployment
+4. **Start LTV monitor** — On the Dashboard, click "Start Monitor" to begin operator-driven LTV polling (every 30s)
+
+### Step 7: Fund and Broker Onboarding
+
+**Broker:**
+1. Login to portal, open PrivaMargin
+2. Go to Client Accounts, invite a fund (by party ID)
+3. Set LTV threshold and allowed assets on the link
+
+**Fund:**
+1. Login to portal, open PrivaMargin
+2. Accept broker invitation in My Brokers
+3. Create a vault in Vault Management, deposit collateral (CC, USDC, ETH)
+4. Open positions against the vault
+
+### Development Server
+
+```bash
+npm run dev
+```
+
+Starts Vite dev server on port 5175. For local development outside the portal iframe, the SDK calls fall back to direct API calls.
 
 ### Type Check
 
@@ -1144,7 +1265,12 @@ stratos-privamargin/
 │   │   └── balances.ts        # On-chain balance reads
 │   ├── custodian/
 │   │   ├── accept-deposit.ts  # Accept CC transfer offers
-│   │   └── withdraw.ts        # Create CC transfer offers
+│   │   ├── withdraw.ts        # Create CC transfer offers (Splice)
+│   │   └── withdraw-usdc.ts   # Transfer USDCHolding (Canton JSON API)
+│   ├── swap/
+│   │   └── cc-to-usdc.ts      # CC→USDC swap via bridge operator
+│   ├── canton/
+│   │   └── seize-collateral.ts # SeizeCollateral vault exercise
 │   └── admin/
 │       └── provision-custodian.ts # Canton custodian party setup
 ├── public/
@@ -1157,12 +1283,13 @@ stratos-privamargin/
 │   │   ├── Positions.tsx      # Position management + detail dialog
 │   │   └── VaultManagement.tsx # Vault lifecycle management
 │   └── services/
-│       ├── api.ts             # Core API layer (~2800 lines)
+│       ├── api.ts             # Core API layer (~3400 lines)
+│       ├── ltvMonitor.ts      # Operator LTV monitor (SDK polling, 30s)
 │       ├── evmEscrow.ts       # EVM ABI encoding + chain config
 │       └── zkProof.ts         # Groth16 proof generation/verification
 ├── workflow/
-│   ├── wrangler.toml          # Workflow worker config (cron, KV binding)
-│   └── ltv-monitor.ts         # LTV Monitor Workflow (every 15 min)
+│   ├── wrangler.toml          # Workflow worker config (KV binding)
+│   └── ltv-monitor.ts         # LTV Monitor Workflow (reference, cron disabled)
 ├── package.json
 ├── vite.config.ts             # Vite config (port 5175)
 └── wrangler.toml              # Cloudflare Pages config + env vars

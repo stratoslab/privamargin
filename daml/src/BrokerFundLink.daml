@@ -69,6 +69,11 @@ template BrokerFundLink
       do
         create this with isActive = False
 
+    choice FundDeactivateLink: ContractId BrokerFundLink
+      controller fund
+      do
+        create this with isActive = False
+
     choice UpdateAllowedAssets: ContractId BrokerFundLink
       with
         newAllowedAssets: [Text]

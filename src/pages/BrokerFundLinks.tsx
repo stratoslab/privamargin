@@ -4,7 +4,7 @@ import {
   Dialog, DialogTitle, DialogContent, DialogActions,
   Switch, FormControlLabel
 } from '@mui/material';
-import { Send, People, Edit, Security, Bolt } from '@mui/icons-material';
+import { Send, People, Edit, Security, Bolt, LinkOff } from '@mui/icons-material';
 import { invitationAPI, linkAPI, proposalAPI, assetAPI } from '../services/api';
 import type { Invitation, BrokerFundLinkData, LTVChangeProposalData } from '../services/api';
 import { useRole } from '../context/RoleContext';
@@ -30,6 +30,7 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
   const [selectedCollaterals, setSelectedCollaterals] = useState<string[]>([]);
   const [allAssetTypes, setAllAssetTypes] = useState<string[]>([]);
   const [autoLiqPrefs, setAutoLiqPrefs] = useState<Record<string, boolean>>({});
+  const [deactivatingLink, setDeactivatingLink] = useState<BrokerFundLinkData | null>(null);
   const { allRoles, assignRole } = useRole();
 
   const partyId = user.partyId || user.id;
@@ -113,6 +114,17 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
       await loadData();
     } catch (error) {
       console.error('Error updating allowed collaterals:', error);
+    }
+  };
+
+  const handleDeactivateLink = async () => {
+    if (!deactivatingLink) return;
+    try {
+      await linkAPI.deactivate(deactivatingLink.contractId);
+      setDeactivatingLink(null);
+      await loadData();
+    } catch (error) {
+      console.error('Error deactivating link:', error);
     }
   };
 
@@ -320,26 +332,42 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
                         />
                       </Box>
                     </Box>
-                    <Button
-                      variant="outlined"
-                      size="small"
-                      startIcon={<Edit />}
-                      disabled={!!pending}
-                      onClick={() => {
-                        setEditingLink(link);
-                        setNewThreshold(link.ltvThreshold * 100);
-                        setNewLeverage(link.leverageRatio);
-                      }}
-                      sx={{
-                        borderColor: 'rgba(139,92,246,0.5)',
-                        color: '#8b5cf6',
-                        textTransform: 'none',
-                        '&:hover': { borderColor: '#8b5cf6', bgcolor: 'rgba(139,92,246,0.1)' },
-                        '&.Mui-disabled': { borderColor: 'rgba(139,92,246,0.2)', color: 'rgba(139,92,246,0.4)' },
-                      }}
-                    >
-                      Propose Change
-                    </Button>
+                    <Box sx={{ display: 'flex', gap: 1 }}>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        startIcon={<Edit />}
+                        disabled={!!pending}
+                        onClick={() => {
+                          setEditingLink(link);
+                          setNewThreshold(link.ltvThreshold * 100);
+                          setNewLeverage(link.leverageRatio);
+                        }}
+                        sx={{
+                          borderColor: 'rgba(139,92,246,0.5)',
+                          color: '#8b5cf6',
+                          textTransform: 'none',
+                          '&:hover': { borderColor: '#8b5cf6', bgcolor: 'rgba(139,92,246,0.1)' },
+                          '&.Mui-disabled': { borderColor: 'rgba(139,92,246,0.2)', color: 'rgba(139,92,246,0.4)' },
+                        }}
+                      >
+                        Propose Change
+                      </Button>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        startIcon={<LinkOff />}
+                        onClick={() => setDeactivatingLink(link)}
+                        sx={{
+                          borderColor: 'rgba(239,68,68,0.4)',
+                          color: '#ef4444',
+                          textTransform: 'none',
+                          '&:hover': { borderColor: '#ef4444', bgcolor: 'rgba(239,68,68,0.1)' },
+                        }}
+                      >
+                        Remove
+                      </Button>
+                    </Box>
                   </Box>
 
                   {/* Auto-Liquidate Toggle */}
@@ -659,6 +687,40 @@ export default function BrokerFundLinks({ user }: BrokerFundLinksProps) {
             sx={{ bgcolor: '#f59e0b', color: '#0a0e14', '&:hover': { bgcolor: '#d97706' } }}
           >
             Save
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Deactivate Link Confirmation Dialog */}
+      <Dialog
+        open={!!deactivatingLink}
+        onClose={() => setDeactivatingLink(null)}
+        maxWidth="sm"
+        fullWidth
+        PaperProps={{ sx: { bgcolor: '#111820', color: 'white' } }}
+      >
+        <DialogTitle sx={{ color: '#ef4444' }}>Remove Fund Link</DialogTitle>
+        <DialogContent>
+          <Typography sx={{ fontSize: 14, color: 'rgba(255,255,255,0.7)', mb: 2 }}>
+            Are you sure you want to deactivate the link with this fund?
+          </Typography>
+          <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.5)' }}>
+            Fund: {deactivatingLink?.fund.split('::')[0]}
+          </Typography>
+          <Typography sx={{ fontSize: 12, color: 'rgba(239,68,68,0.7)', mt: 1 }}>
+            The fund will no longer be able to open new positions through you.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeactivatingLink(null)} sx={{ color: 'rgba(255,255,255,0.5)' }}>
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            onClick={handleDeactivateLink}
+            sx={{ bgcolor: '#ef4444', '&:hover': { bgcolor: '#dc2626' } }}
+          >
+            Remove Link
           </Button>
         </DialogActions>
       </Dialog>

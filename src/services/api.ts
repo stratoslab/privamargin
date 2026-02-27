@@ -23,7 +23,7 @@ export function toDecimal10(n: number): string {
 
 // CPCV Package ID (deterministic hash - same across all participant nodes)
 // Must match the DAR file: daml/.daml/dist/privamargin9-0.1.0.dar
-const CPCV_PACKAGE_ID = '8b236fb5625487acc71d63fe6a8ba86e147e8c5c32db167e519437444f1092d6';
+const CPCV_PACKAGE_ID = '7ec21898f814e51ebc1aa86795f7495ac43a10223aa7fdb230dc5ca51533b02f';
 
 // Template IDs for PrivaMargin Daml contracts (from cpcv-hackathon)
 // Format: PackageId:ModuleName:TemplateName
@@ -85,6 +85,7 @@ export const CHOICES = {
   SET_LTV_THRESHOLD: 'SetLTVThreshold',
   SET_LEVERAGE_RATIO: 'SetLeverageRatio',
   DEACTIVATE_LINK: 'DeactivateLink',
+  FUND_DEACTIVATE_LINK: 'FundDeactivateLink',
   PROPOSE_LTV_CHANGE: 'ProposeLTVChange',
   // BrokerFundLink allowed assets / collaterals
   UPDATE_ALLOWED_ASSETS: 'UpdateAllowedAssets',
@@ -722,6 +723,12 @@ export const vaultAPI = {
     const vaultContract = vaults[0];
     const owner = (vaultContract.payload as Record<string, unknown>).owner as string;
     const operator = (vaultContract.payload as Record<string, unknown>).operator as string;
+    // Resolve the SDK's own party ID — this must match what Canton sees as actAs
+    const sdkParty = await sdk.getPartyId?.() || owner;
+    console.log(`[depositReal] vaultId=${vaultId}, owner=${owner}, sdkParty=${sdkParty}, operator=${operator}, cid=${vaultContract.contractId.slice(0, 20)}...`);
+    if (sdkParty !== owner) {
+      console.warn(`[depositReal] Party mismatch! SDK party=${sdkParty} vs vault owner=${owner}`);
+    }
 
     // Step 1: Real transfer — route based on chain type
     // If vault has an EVM escrow registered for this chain, send directly to escrow contract
@@ -824,12 +831,13 @@ export const vaultAPI = {
     const valueUSD = amount * price;
     const assetTypeEnum = mapAssetTypeToEnum(symbol);
 
-    // Create and accept TokenizedAsset
+    // Create and accept TokenizedAsset — use sdkParty as issuer/recipient
+    // so Canton's actAs matches the signatory
     const issuanceResult = await sdk.cantonCreate({
       templateId: TEMPLATE_IDS.ASSET_ISSUANCE,
       payload: {
-        issuer: owner,
-        recipient: owner,
+        issuer: sdkParty,
+        recipient: sdkParty,
         assetId,
         assetType: assetTypeEnum,
         amount: toDecimal10(amount),
@@ -847,9 +855,17 @@ export const vaultAPI = {
     )?.contractId;
     if (!tokenizedAssetCid) throw new Error('Failed to create TokenizedAsset');
 
-    // Step 3: Deposit into vault with tx tracking
+    // Step 3: Re-query vault for fresh contractId (may have changed during steps 1-2)
+    const freshVaults = await sdk.cantonQuery({
+      templateId: TEMPLATE_IDS.VAULT,
+      filter: { vaultId }
+    });
+    const freshVaultCid = freshVaults.length > 0 ? freshVaults[0].contractId : vaultContract.contractId;
+    console.log(`[depositReal] Step 3: depositing assetCid=${tokenizedAssetCid?.slice(0, 16)}... into vault cid=${freshVaultCid.slice(0, 20)}...`);
+
+    // Deposit into vault with tx tracking
     await sdk.cantonExercise({
-      contractId: vaultContract.contractId,
+      contractId: freshVaultCid,
       templateId: TEMPLATE_IDS.VAULT,
       choice: CHOICES.DEPOSIT_ASSET_WITH_TX,
       argument: {
@@ -1732,7 +1748,7 @@ export const roleAPI = {
         });
         return { data: { contractId: result.contractId } };
       } catch (error) {
-        console.warn('Canton createOperatorRole failed:', error);
+        console.debug('Canton createOperatorRole failed:', error);
       }
     }
     return { data: { contractId: null } };
@@ -1750,7 +1766,7 @@ export const roleAPI = {
           return { data: { contractId: contracts[0].contractId } };
         }
       } catch (error) {
-        console.warn('Canton getOperatorRole failed:', error);
+        console.debug('Canton getOperatorRole failed (falling back to KV):', error);
       }
     }
     return { data: { contractId: null } };
@@ -1820,7 +1836,7 @@ export const roleAPI = {
           return { data: { contractId: contracts[0].contractId } };
         }
       } catch (error) {
-        console.warn('Canton getBrokerRole failed:', error);
+        console.debug('Canton getBrokerRole failed (falling back to KV):', error);
       }
     }
     return { data: { contractId: null } };
@@ -1860,7 +1876,7 @@ export const roleAPI = {
           })),
         };
       } catch (error) {
-        console.warn('Canton getRoleAssignments failed:', error);
+        console.debug('Canton getRoleAssignments failed (falling back to KV):', error);
       }
     }
     return { data: [] };
@@ -1883,7 +1899,7 @@ export const roleAPI = {
           };
         }
       } catch (error) {
-        console.warn('Canton getRoleForParty failed:', error);
+        console.debug('Canton getRoleForParty failed (falling back to KV):', error);
       }
     }
     return { data: { contractId: null, role: null } };
@@ -2239,6 +2255,24 @@ export const linkAPI = {
     }
     throw new Error('SDK not available');
   },
+
+  fundDeactivate: async (contractId: string) => {
+    if (sdk) {
+      try {
+        await sdk.cantonExercise({
+          contractId,
+          templateId: TEMPLATE_IDS.BROKER_FUND_LINK,
+          choice: CHOICES.FUND_DEACTIVATE_LINK,
+          argument: {},
+        });
+        return { data: { success: true } };
+      } catch (error) {
+        console.warn('Canton fundDeactivateLink failed:', error);
+        throw error;
+      }
+    }
+    throw new Error('SDK not available');
+  },
 };
 
 // LTV Change Proposal API
@@ -2522,11 +2556,43 @@ async function recalcPositionsLive(positions: PositionData[]): Promise<PositionD
 
   const result = [...positions];
 
-  // ZK proof generation — fund only, one proof per vault, skip if recent proof exists
+  // Populate collateralValue for fund positions by querying vaults
   try {
     const currentParty = await sdk.getPartyId?.() || '';
     const fundParties = [...new Set(result.map(p => p.fund))];
     const isFund = fundParties.includes(currentParty);
+
+    // Fetch vault values for all active positions (fund sees own collateral)
+    const activePositions = result.filter(p => p.status === 'Open' || p.status === 'MarginCalled');
+    const uniqueVaultIds = [...new Set(activePositions.map(p => p.vaultId))];
+    const vaultValues: Record<string, number> = {};
+    const positionsPerVault: Record<string, number> = {};
+
+    for (const vid of uniqueVaultIds) {
+      try {
+        const vaults = await sdk.cantonQuery({ templateId: TEMPLATE_IDS.VAULT, filter: { vaultId: vid } });
+        if (vaults.length > 0) {
+          const vault = await recalcVaultPrices(contractToVault(vaults[0]));
+          vaultValues[vid] = vault.totalValue;
+        }
+      } catch { /* skip */ }
+    }
+
+    // Count positions per vault for proportional allocation
+    for (const pos of activePositions) {
+      positionsPerVault[pos.vaultId] = (positionsPerVault[pos.vaultId] || 0) + 1;
+    }
+
+    // Set collateralValue on each position (vault value / number of positions sharing it)
+    for (let i = 0; i < result.length; i++) {
+      const pos = result[i];
+      if (pos.status !== 'Open' && pos.status !== 'MarginCalled') continue;
+      const vaultVal = vaultValues[pos.vaultId];
+      if (vaultVal !== undefined && vaultVal > 0) {
+        const shareCount = positionsPerVault[pos.vaultId] || 1;
+        result[i] = { ...pos, collateralValue: vaultVal / shareCount };
+      }
+    }
 
     if (isFund) {
       const { generateLTVProof, proofHash: computeProofHash, usdToCents, isZKAvailable } =
@@ -2534,19 +2600,6 @@ async function recalcPositionsLive(positions: PositionData[]): Promise<PositionD
 
       const zkAvail = await isZKAvailable();
       if (!zkAvail) return result;
-
-      // Fetch vault values and link leverage (only for ZK proof inputs)
-      const uniqueVaultIds = [...new Set(result.filter(p => p.status === 'Open' || p.status === 'MarginCalled').map(p => p.vaultId))];
-      const vaultValues: Record<string, number> = {};
-      for (const vid of uniqueVaultIds) {
-        try {
-          const vaults = await sdk.cantonQuery({ templateId: TEMPLATE_IDS.VAULT, filter: { vaultId: vid } });
-          if (vaults.length > 0) {
-            const vault = await recalcVaultPrices(contractToVault(vaults[0]));
-            vaultValues[vid] = vault.totalValue;
-          }
-        } catch { /* skip */ }
-      }
 
       // Aggregate notional per vault
       const vaultAgg: Record<string, number> = {};

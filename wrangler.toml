@@ -12,7 +12,7 @@ id = "7c64523d0f71497183bd9a20295df71a"
 
 [vars]
 # Canton package ID (update after building DAR with: npm run build:dar)
-PACKAGE_ID = "4b60e70f9f90e2164c86529fe91dbacf858a0b0de2498a5366e33120691d09a6"
+PACKAGE_ID = "7ec21898f814e51ebc1aa86795f7495ac43a10223aa7fdb230dc5ca51533b02f"
 # CoinMarketCap API key for live prices
 COINMARKETCAP_API_KEY = "441479ed834c4782a04e48d0cb2c2160"
 # RPC endpoints for escrow deployer (public RPCs, replace with private for production)

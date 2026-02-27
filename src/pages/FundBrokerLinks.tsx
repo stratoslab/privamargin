@@ -3,7 +3,7 @@ import {
   Box, Typography, Button, Chip, Grid,
   Dialog, DialogTitle, DialogContent, DialogActions
 } from '@mui/material';
-import { CheckCircle, Cancel, Handshake, Warning } from '@mui/icons-material';
+import { CheckCircle, Cancel, Handshake, Warning, LinkOff } from '@mui/icons-material';
 import { invitationAPI, linkAPI, proposalAPI } from '../services/api';
 import type { Invitation, BrokerFundLinkData, LTVChangeProposalData } from '../services/api';
 import type { AuthUser } from '@stratos-wallet/sdk';
@@ -18,6 +18,7 @@ export default function FundBrokerLinks({ user }: FundBrokerLinksProps) {
   const [proposals, setProposals] = useState<LTVChangeProposalData[]>([]);
   const [processing, setProcessing] = useState<string | null>(null);
   const [rejectingProposal, setRejectingProposal] = useState<LTVChangeProposalData | null>(null);
+  const [deactivatingLink, setDeactivatingLink] = useState<BrokerFundLinkData | null>(null);
 
   const partyId = user.partyId || user.id;
 
@@ -85,6 +86,20 @@ export default function FundBrokerLinks({ user }: FundBrokerLinksProps) {
       await loadData();
     } catch (error) {
       console.error('Error rejecting proposal:', error);
+    } finally {
+      setProcessing(null);
+    }
+  };
+
+  const handleFundDeactivateLink = async () => {
+    if (!deactivatingLink) return;
+    setProcessing(deactivatingLink.contractId);
+    try {
+      await linkAPI.fundDeactivate(deactivatingLink.contractId);
+      setDeactivatingLink(null);
+      await loadData();
+    } catch (error) {
+      console.error('Error deactivating link:', error);
     } finally {
       setProcessing(null);
     }
@@ -310,16 +325,33 @@ export default function FundBrokerLinks({ user }: FundBrokerLinksProps) {
                     <Typography sx={{ fontSize: 14, fontWeight: 500, color: 'white' }}>
                       {link.broker.split('::')[0]}
                     </Typography>
-                    <Chip
-                      label={link.isActive ? 'Active' : 'Inactive'}
-                      size="small"
-                      sx={{
-                        bgcolor: link.isActive ? 'rgba(0,212,170,0.2)' : 'rgba(255,255,255,0.1)',
-                        color: link.isActive ? '#00d4aa' : 'rgba(255,255,255,0.5)',
-                        fontWeight: 600,
-                        fontSize: 11,
-                      }}
-                    />
+                    <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
+                      <Chip
+                        label={link.isActive ? 'Active' : 'Inactive'}
+                        size="small"
+                        sx={{
+                          bgcolor: link.isActive ? 'rgba(0,212,170,0.2)' : 'rgba(255,255,255,0.1)',
+                          color: link.isActive ? '#00d4aa' : 'rgba(255,255,255,0.5)',
+                          fontWeight: 600,
+                          fontSize: 11,
+                        }}
+                      />
+                      <Button
+                        size="small"
+                        startIcon={<LinkOff sx={{ fontSize: 14 }} />}
+                        onClick={() => setDeactivatingLink(link)}
+                        sx={{
+                          color: '#ef4444',
+                          textTransform: 'none',
+                          fontSize: 11,
+                          minWidth: 'auto',
+                          py: 0,
+                          '&:hover': { bgcolor: 'rgba(239,68,68,0.1)' },
+                        }}
+                      >
+                        Remove
+                      </Button>
+                    </Box>
                   </Box>
                   <Box sx={{ display: 'flex', gap: 3, mb: 1.5 }}>
                     <Box>
@@ -441,6 +473,41 @@ export default function FundBrokerLinks({ user }: FundBrokerLinksProps) {
             sx={{ bgcolor: '#ef4444', '&:hover': { bgcolor: '#dc2626' } }}
           >
             Confirm Reject
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Deactivate Link Confirmation Dialog */}
+      <Dialog
+        open={!!deactivatingLink}
+        onClose={() => setDeactivatingLink(null)}
+        maxWidth="sm"
+        fullWidth
+        PaperProps={{ sx: { bgcolor: '#111820', color: 'white' } }}
+      >
+        <DialogTitle sx={{ color: '#ef4444' }}>Remove Broker Link</DialogTitle>
+        <DialogContent>
+          <Typography sx={{ fontSize: 14, color: 'rgba(255,255,255,0.7)', mb: 2 }}>
+            Are you sure you want to deactivate the link with this broker?
+          </Typography>
+          <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.5)' }}>
+            Broker: {deactivatingLink?.broker.split('::')[0]}
+          </Typography>
+          <Typography sx={{ fontSize: 12, color: 'rgba(239,68,68,0.7)', mt: 1 }}>
+            You will no longer be able to open new positions through this broker.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeactivatingLink(null)} sx={{ color: 'rgba(255,255,255,0.5)' }}>
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            onClick={handleFundDeactivateLink}
+            disabled={!!processing}
+            sx={{ bgcolor: '#ef4444', '&:hover': { bgcolor: '#dc2626' } }}
+          >
+            Remove Link
           </Button>
         </DialogActions>
       </Dialog>

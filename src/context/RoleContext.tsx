@@ -69,25 +69,29 @@ export function RoleProvider({ user, children }: { user: AuthUser | null; childr
   const refreshRoles = useCallback(async () => {
     if (!partyId) return;
     try {
-      // Try Canton ledger first for role assignments
-      const cantonAssignments = await roleAPI.getRoleAssignments();
-      if (cantonAssignments.data.length > 0) {
-        // Build allRoles from Canton contracts
-        const cantonRoles: Record<string, string> = {};
-        for (const a of cantonAssignments.data) {
-          cantonRoles[a.party] = cantonRoleToUserRole(a.role) || a.role;
+      // Try Canton ledger first — query only for current user's role (avoids 403 for
+      // users who have no RoleAssignment contract on Canton)
+      let foundCantonRole = false;
+      try {
+        const myRole = await roleAPI.getRoleForParty(partyId);
+        if (myRole.data.role) {
+          setRole(cantonRoleToUserRole(myRole.data.role));
+          foundCantonRole = true;
         }
-        setAllRoles(cantonRoles);
-        setRole(cantonRoleToUserRole(cantonRoles[partyId] || null));
-      } else {
-        // Fallback to KV API
-        const roleRes = await fetch(`/api/roles?partyId=${encodeURIComponent(partyId)}`);
-        const roleData = await roleRes.json() as { role?: string };
-        setRole((roleData.role as UserRole) || null);
+      } catch {
+        // Canton role query failed — fall through to KV
+      }
 
-        const allRes = await fetch('/api/roles');
-        const allData = await allRes.json() as { roles?: Record<string, string> };
-        setAllRoles(allData.roles || {});
+      // Always load full role list from KV (Canton only stores roles for parties
+      // assigned via ledger, not KV-only assignments)
+      const allRes = await fetch('/api/roles');
+      const allData = await allRes.json() as { roles?: Record<string, string> };
+      setAllRoles(allData.roles || {});
+
+      if (!foundCantonRole) {
+        // Fallback to KV for current user's role
+        const kvRole = (allData.roles || {})[partyId];
+        setRole((kvRole as UserRole) || null);
       }
 
       // Check if an operator exists and if current user is the operator
