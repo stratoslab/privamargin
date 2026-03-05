@@ -20,7 +20,8 @@ PrivaMargin enables hedge funds to prove margin sufficiency to prime brokers usi
 - [Liquidation Workflow](#liquidation-workflow)
 - [Broker-Fund Relationships](#broker-fund-relationships)
 - [Margin Verification](#margin-verification)
-- [LTV Monitor Workflow](#ltv-monitor-workflow)
+- [LTV Monitor Workflow](#ltv-monitor-workflow) *(deprecated — see CRE)*
+- [Future: Chainlink CRE](#future-chainlink-cre)
 - [Auto-Liquidate Preference](#auto-liquidate-preference)
 - [API Layer](#api-layer)
 - [Cloudflare Pages Functions](#cloudflare-pages-functions)
@@ -47,8 +48,9 @@ PrivaMargin enables hedge funds to prove margin sufficiency to prime brokers usi
 │  /api/escrow/balances · /api/custodian/*  · /api/roles   │
 │  /api/auto-liquidate                                      │
 ├──────────────────────────────────────────────────────────┤
-│              Cloudflare Workflow Worker                    │
+│              Cloudflare Workflow Worker  [DEPRECATED]      │
 │  LTV Monitor (cron: every min, KV-gated interval)         │
+│  → Being replaced by Chainlink CRE (see privamargin-cre)  │
 │  Reads: Canton positions/vaults/links + KV auto-liq prefs │
 │  Writes: margin calls, position updates, auto-liquidation │
 ├─────────────────────────┬───────────────────────────────┤
@@ -739,6 +741,8 @@ ZK proofs are generated automatically during the fund's normal position flow (no
 
 ## LTV Monitor Workflow
 
+> **Deprecation Notice:** The Cloudflare Workflow and browser-side polling approaches described below are being replaced by the **Chainlink Runtime Environment (CRE)**. See [`privamargin-cre`](../privamargin-cre/) for the future implementation. CRE runs LTV monitoring on a Decentralized Oracle Network — prices are consensus-backed, LTV computations are verifiable on-chain, and liquidation triggers are tamper-proof. This eliminates the centralized trust assumptions of both the Cloudflare Worker cron and the operator dashboard polling.
+
 A Cloudflare Workflow Worker (`workflow/ltv-monitor.ts`) runs on a per-minute cron schedule with a KV-configurable check interval (default 15 minutes) to automatically monitor all open positions and take action when LTV thresholds are breached. The operator can change the check frequency from the dashboard UI without redeploying.
 
 ### Workflow Steps
@@ -847,6 +851,37 @@ wrangler secret put OPERATOR_PARTY
 wrangler secret put DEPLOYER_PRIVATE_KEY
 wrangler secret put CANTON_AUTH_SECRET
 ```
+
+---
+
+## Future: Chainlink CRE
+
+The LTV monitoring system is being migrated from the Cloudflare Workflow Worker and browser-side polling to the **Chainlink Runtime Environment (CRE)**. The full implementation lives in [`privamargin-cre`](../privamargin-cre/).
+
+### Why migrate?
+
+| Current approach | Limitation |
+|-----------------|------------|
+| Cloudflare Worker cron | Centralized — single operator runs the check; cannot reach Canton JSON API from Workers (404) |
+| Browser-side polling (Operator Dashboard) | Requires operator to keep dashboard open; no uptime guarantee |
+| Both | No verifiable proof that prices were correct or that LTV computation wasn't manipulated |
+
+### What CRE provides
+
+The Chainlink Runtime Environment operates the LTV monitor on a Decentralized Oracle Network (DON). It retrieves all active positions from PrivaMargin via the Canton Network ledger API, then fetches oracle prices from CoinGecko and other data providers through the Chainlink Decentralized Oracle Network.
+
+Using this data, it calculates the loan-to-value (LTV) ratio for each position and generates a verifiable proof of every calculation. The updated LTV values, along with their corresponding proofs, are then written back to the Canton Network via its API.
+
+This architecture ensures the entire workflow is transparent, publicly verifiable, and tamper-evident. Even if individual HTTP endpoints are compromised, the on-ledger records and oracle proofs allow any discrepancies or operational lapses to be traced and audited with confidence.
+
+### Key advantages
+
+- **Consensus-backed prices** — N independent DON nodes fetch prices and agree on median
+- **On-chain attestations** — every LTV computation is recorded on LTVOracle.sol (verifiable by anyone)
+- **Tamper-proof liquidation triggers** — no single party can fake a threshold breach
+- **Always-on** — no dependency on operator browser sessions or cron workers
+
+See [`privamargin-cre/README.md`](../privamargin-cre/README.md) for setup, architecture, and deployment instructions.
 
 ---
 
@@ -1288,12 +1323,12 @@ stratos-privamargin/
 │   │   └── VaultManagement.tsx # Vault lifecycle management
 │   └── services/
 │       ├── api.ts             # Core API layer (~3400 lines)
-│       ├── ltvMonitor.ts      # Operator LTV monitor (SDK polling, 30s)
+│       ├── ltvMonitor.ts      # Operator LTV monitor (SDK polling, 30s) [deprecated → privamargin-cre]
 │       ├── evmEscrow.ts       # EVM ABI encoding + chain config
 │       └── zkProof.ts         # Groth16 proof generation/verification
 ├── workflow/
 │   ├── wrangler.toml          # Workflow worker config (KV binding)
-│   └── ltv-monitor.ts         # LTV Monitor Workflow (reference, cron disabled)
+│   └── ltv-monitor.ts         # LTV Monitor Workflow [deprecated → privamargin-cre]
 ├── package.json
 ├── vite.config.ts             # Vite config (port 5175)
 └── wrangler.toml              # Cloudflare Pages config + env vars

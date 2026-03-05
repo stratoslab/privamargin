@@ -11,6 +11,7 @@
     "update-package-id": "PKGID=$(daml damlc inspect daml/.daml/dist/*.dar 2>/dev/null | head -1 | awk '{print $2}') && sed -i \"s/^PACKAGE_ID = .*/PACKAGE_ID = \\\"$PKGID\\\"/\" wrangler.toml && echo \"Updated PACKAGE_ID to $PKGID\"",
     "preview": "vite preview",
     "deploy": "npm run build && wrangler pages deploy dist",
+    "deploy:landing": "cd landing && npm run deploy",
     "lint": "tsc --noEmit",
     "build:zk": "bash circuits/build.sh"
   },

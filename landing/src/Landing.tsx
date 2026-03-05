@@ -14,6 +14,9 @@ import {
   Shield,
   ArrowForward,
   KeyboardArrowDown,
+  Hub,
+  Visibility,
+  Fingerprint,
 } from '@mui/icons-material';
 
 // ── App URL — points to the main Cloudflare Pages deployment ───────────
@@ -211,25 +214,6 @@ const steps = [
   },
 ];
 
-// ── Architecture layers ────────────────────────────────────────────────
-const archLayers = [
-  {
-    color: PURPLE,
-    label: 'Application Layer',
-    items: ['Fund Dashboard', 'Broker Portal', 'Operator Console'],
-  },
-  {
-    color: TEAL,
-    label: 'Canton Network',
-    items: ['Daml Contracts', 'Role Management', 'Ledger API'],
-  },
-  {
-    color: AMBER,
-    label: 'EVM & ZK Layer',
-    items: ['Escrow Contracts', 'Groth16 Proofs', 'Multi-Chain Bridge'],
-  },
-];
-
 // ── Supported chains ───────────────────────────────────────────────────
 const chains = [
   { name: 'Canton', status: 'Native', color: TEAL },
@@ -297,7 +281,7 @@ export default function Landing() {
         </Box>
 
         <Box sx={{ display: { xs: 'none', md: 'flex' }, gap: 3, alignItems: 'center' }}>
-          {['Features', 'How It Works', 'Architecture'].map((label) => (
+          {['Features', 'How It Works'].map((label) => (
             <Typography
               key={label}
               onClick={() => scrollTo(label.toLowerCase().replace(/\s+/g, '-'))}
@@ -782,9 +766,9 @@ export default function Landing() {
         </Container>
       </Section>
 
-      {/* ─── Architecture ───────────────────────────────────────────── */}
+      {/* ─── Chainlink Runtime Environment ─────────────────────────── */}
       <Section id="architecture">
-        <Container maxWidth="md">
+        <Container maxWidth="lg">
           <Typography
             sx={{
               fontSize: { xs: 28, md: 40 },
@@ -795,95 +779,187 @@ export default function Landing() {
               letterSpacing: '-0.5px',
             }}
           >
-            System <span style={{ color: AMBER }}>Architecture</span>
+            Chainlink <span style={{ color: AMBER }}>Runtime Environment</span>
           </Typography>
           <Typography
             sx={{
               fontSize: 16,
               color: 'rgba(255,255,255,0.5)',
               textAlign: 'center',
-              maxWidth: 520,
+              maxWidth: 600,
               mx: 'auto',
-              mb: 6,
+              mb: 8,
               fontFamily: '"Outfit", sans-serif',
+              lineHeight: 1.7,
             }}
           >
-            Three layers working together to deliver private, verifiable
-            collateral management.
+            The Chainlink Runtime Environment operates the LTV monitor — retrieving
+            active positions from PrivaMargin via the Canton Network ledger API,
+            then fetching oracle prices through the Chainlink Decentralized Oracle
+            Network.
           </Typography>
 
-          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            {archLayers.map((layer, idx) => (
-              <Box key={layer.label}>
+          <Box
+            sx={{
+              display: 'grid',
+              gridTemplateColumns: { xs: '1fr', md: '1fr 1fr 1fr' },
+              gap: 3,
+              mb: 6,
+            }}
+          >
+            {[
+              {
+                icon: Hub,
+                color: AMBER,
+                title: 'Oracle-Powered LTV',
+                desc: 'Calculates the loan-to-value ratio for each position using real-time prices from CoinGecko and other data providers through the Chainlink Decentralized Oracle Network.',
+              },
+              {
+                icon: Fingerprint,
+                color: PURPLE,
+                title: 'Verifiable Proofs',
+                desc: 'Every LTV calculation generates a verifiable proof. Updated values and their corresponding proofs are written back to the Canton Network via its API.',
+              },
+              {
+                icon: Visibility,
+                color: TEAL,
+                title: 'Transparent & Tamper-Evident',
+                desc: 'Even if individual HTTP endpoints are compromised, the on-ledger records and oracle proofs allow any discrepancies or operational lapses to be traced and audited with confidence.',
+              },
+            ].map((item) => (
+              <Box
+                key={item.title}
+                sx={{
+                  bgcolor: CARD,
+                  borderRadius: '16px',
+                  border: `1px solid ${BORDER}`,
+                  p: 3.5,
+                  transition: 'border-color 0.3s, transform 0.3s',
+                  '&:hover': {
+                    borderColor: `${item.color}40`,
+                    transform: 'translateY(-4px)',
+                  },
+                }}
+              >
                 <Box
                   sx={{
-                    bgcolor: CARD,
-                    borderRadius: '16px',
-                    border: `1px solid ${layer.color}30`,
-                    p: 3,
+                    width: 44,
+                    height: 44,
+                    borderRadius: '12px',
+                    bgcolor: `${item.color}15`,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    mb: 2,
                   }}
                 >
-                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2 }}>
-                    <Box
-                      sx={{
-                        width: 10,
-                        height: 10,
-                        borderRadius: '50%',
-                        bgcolor: layer.color,
-                      }}
-                    />
-                    <Typography
-                      sx={{
-                        fontSize: 16,
-                        fontWeight: 600,
-                        color: layer.color,
-                        fontFamily: '"Outfit", sans-serif',
-                      }}
-                    >
-                      {layer.label}
-                    </Typography>
-                  </Box>
-                  <Box
-                    sx={{
-                      display: 'flex',
-                      gap: 1.5,
-                      flexWrap: 'wrap',
-                    }}
-                  >
-                    {layer.items.map((item) => (
-                      <Box
-                        key={item}
-                        sx={{
-                          px: 2,
-                          py: 0.8,
-                          bgcolor: `${layer.color}10`,
-                          borderRadius: '8px',
-                          border: `1px solid ${layer.color}20`,
-                        }}
-                      >
-                        <Typography
-                          sx={{
-                            fontSize: 13,
-                            color: 'rgba(255,255,255,0.7)',
-                            fontFamily: '"Outfit", sans-serif',
-                          }}
-                        >
-                          {item}
-                        </Typography>
-                      </Box>
-                    ))}
-                  </Box>
+                  <item.icon sx={{ color: item.color, fontSize: 22 }} />
                 </Box>
-                {/* Arrow connector between layers */}
-                {idx < archLayers.length - 1 && (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', py: 0.5 }}>
-                    <KeyboardArrowDown
-                      sx={{ color: 'rgba(255,255,255,0.15)', fontSize: 28 }}
-                    />
-                  </Box>
-                )}
+                <Typography
+                  sx={{
+                    fontSize: 17,
+                    fontWeight: 600,
+                    mb: 1,
+                    fontFamily: '"Outfit", sans-serif',
+                  }}
+                >
+                  {item.title}
+                </Typography>
+                <Typography
+                  sx={{
+                    fontSize: 14,
+                    color: 'rgba(255,255,255,0.5)',
+                    lineHeight: 1.6,
+                    fontFamily: '"Outfit", sans-serif',
+                  }}
+                >
+                  {item.desc}
+                </Typography>
               </Box>
             ))}
+          </Box>
+
+          {/* Architecture flow diagram */}
+          <Box
+            sx={{
+              bgcolor: CARD,
+              borderRadius: '16px',
+              border: `1px solid ${BORDER}`,
+              p: { xs: 3, md: 4 },
+            }}
+          >
+            <Typography
+              sx={{
+                fontSize: 15,
+                fontWeight: 600,
+                mb: 3,
+                fontFamily: '"Outfit", sans-serif',
+                color: AMBER,
+                textAlign: 'center',
+              }}
+            >
+              End-to-End Flow
+            </Typography>
+            <Box
+              sx={{
+                display: 'flex',
+                flexDirection: { xs: 'column', md: 'row' },
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: { xs: 1, md: 0 },
+              }}
+            >
+              {[
+                'Canton Ledger API',
+                'Retrieve Positions',
+                'Chainlink DON',
+                'Fetch Oracle Prices',
+                'Compute LTV + Proof',
+                'Write Back to Canton',
+              ].map((label, i, arr) => (
+                <Box
+                  key={label}
+                  sx={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: { xs: 1, md: 0 },
+                    flexDirection: { xs: 'column', md: 'row' },
+                  }}
+                >
+                  <Box
+                    sx={{
+                      px: 2,
+                      py: 1,
+                      bgcolor: 'rgba(255,255,255,0.04)',
+                      borderRadius: '8px',
+                      border: `1px solid ${BORDER}`,
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    <Typography
+                      sx={{
+                        fontSize: 12,
+                        fontFamily: '"JetBrains Mono", monospace',
+                        color: i % 2 === 0 ? TEAL : 'rgba(255,255,255,0.6)',
+                        fontWeight: 500,
+                      }}
+                    >
+                      {label}
+                    </Typography>
+                  </Box>
+                  {i < arr.length - 1 && (
+                    <ArrowForward
+                      sx={{
+                        fontSize: 16,
+                        color: 'rgba(255,255,255,0.2)',
+                        mx: 1,
+                        transform: { xs: 'rotate(90deg)', md: 'none' },
+                      }}
+                    />
+                  )}
+                </Box>
+              ))}
+            </Box>
           </Box>
         </Container>
       </Section>
@@ -1059,7 +1135,7 @@ export default function Landing() {
 
             {/* Links */}
             <Box sx={{ display: 'flex', gap: 3, flexWrap: 'wrap', justifyContent: 'center' }}>
-              {['Features', 'How It Works', 'Architecture'].map((label) => (
+              {['Features', 'How It Works'].map((label) => (
                 <Typography
                   key={label}
                   onClick={() => scrollTo(label.toLowerCase().replace(/\s+/g, '-'))}
