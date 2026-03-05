@@ -6,7 +6,7 @@ PrivaMargin enables hedge funds to prove margin sufficiency to prime brokers usi
 
 **Live Demo:** [portal.stratoslab.xyz](https://portal.stratoslab.xyz/?code=525ZVB8D)
 
-[![PrivaMargin Demo](https://img.youtube.com/vi/ex3KanbFG1s/maxresdefault.jpg)](https://youtu.be/ex3KanbFG1s)
+[![PrivaMargin Demo](https://img.youtube.com/vi/Q_IqZhUsV_U/maxresdefault.jpg)](https://youtu.be/Q_IqZhUsV_U)
 
 ## Table of Contents
 

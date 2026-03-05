@@ -484,7 +484,7 @@ export default function Landing() {
             }}
           >
             <iframe
-              src="https://www.youtube.com/embed/ex3KanbFG1s"
+              src="https://www.youtube.com/embed/Q_IqZhUsV_U"
               title="PrivaMargin Demo"
               allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
               allowFullScreen
