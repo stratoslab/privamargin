@@ -2,30 +2,23 @@
  * POST /api/swap/cc-to-usdc
  *
  * Swaps CC held by the custodian for USDC from the bridge operator.
- * 1. Custodian sends CC to bridge operator (Splice TransferOffer + accept)
- * 2. Bridge operator sends equivalent USDC to custodian (USDCHolding Transfer)
+ * 1. Custodian transfers CC to bridge operator (proxy exercise Transfer)
+ * 2. Bridge operator sends equivalent USDC to custodian (proxy exercise Transfer)
  *
  * Body: { ccAmount: number, usdcAmount: number }
- *   ccAmount  — CC units to send to bridge
- *   usdcAmount — USDC to receive back (based on live CC price at liquidation time)
- *
  * Auth: same-origin only (called from privamargin frontend after liquidation)
  */
 
-import * as jwt from 'jsonwebtoken';
+import { proxyQuery, proxyExercise } from '../../_lib/proxy-client';
 
 interface Env {
-  SPLICE_HOST: string;
-  SPLICE_PORT: string;
-  CANTON_JSON_HOST: string;
-  CANTON_AUTH_SECRET: string;
-  CANTON_AUTH_AUDIENCE: string;
-  CUSTODIAN_USER: string;
-  SPLICE_ADMIN_USER: string;
+  PROXY_API_URL: string;
+  PROXY_API_KEY: string;
+  CC_TEMPLATE_ID: string;
   USDC_TEMPLATE_ID: string;
+  CUSTODIAN_PARTY: string;
+  BRIDGE_OPERATOR_PARTY: string;
   PRIVAMARGIN_CONFIG: KVNamespace;
-  // Optional: override bridge operator Splice username (default: bridge-operator)
-  BRIDGE_OPERATOR_USER?: string;
 }
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -33,61 +26,6 @@ function jsonResponse(data: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
-}
-
-function generateSpliceToken(env: Env, user: string): string {
-  return jwt.sign(
-    {
-      aud: env.CANTON_AUTH_AUDIENCE || 'https://canton.network.global',
-      sub: user,
-      exp: Math.floor(Date.now() / 1000) + 3600,
-    },
-    env.CANTON_AUTH_SECRET || 'unsafe',
-    { algorithm: 'HS256' },
-  );
-}
-
-function getSpliceBaseUrl(env: Env): string {
-  const host = env.SPLICE_HOST || 'p1.cantondefi.com';
-  const port = parseInt(env.SPLICE_PORT || '443');
-  const protocol = port === 443 ? 'https' : 'http';
-  const portStr = port === 443 ? '' : `:${port}`;
-  return `${protocol}://${host}${portStr}/api/validator/v0`;
-}
-
-function getCantonBaseUrl(env: Env): string {
-  const host = env.CANTON_JSON_HOST || 'localhost';
-  return `https://${host}/v2`;
-}
-
-function generateCantonToken(env: Env): string {
-  return jwt.sign(
-    {
-      aud: env.CANTON_AUTH_AUDIENCE || 'https://canton.network.global',
-      sub: env.SPLICE_ADMIN_USER || 'app-user',
-      exp: Math.floor(Date.now() / 1000) + 3600,
-    },
-    env.CANTON_AUTH_SECRET || 'unsafe',
-    { algorithm: 'HS256' },
-  );
-}
-
-async function cantonFetch<T>(env: Env, endpoint: string, body?: unknown): Promise<T> {
-  const token = generateCantonToken(env);
-  const url = `${getCantonBaseUrl(env)}${endpoint}`;
-  const res = await fetch(url, {
-    method: body ? 'POST' : 'GET',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Canton API ${res.status}: ${errText}`);
-  }
-  return res.json() as Promise<T>;
 }
 
 export const onRequestPost: PagesFunction<Env> = async (context) => {
@@ -105,187 +43,123 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       return jsonResponse({ error: 'Missing or invalid ccAmount / usdcAmount' }, 400);
     }
 
-    const bridgeUser = env.BRIDGE_OPERATOR_USER || 'bridge-operator';
-    const custodianUser = env.CUSTODIAN_USER || 'vault-custodian';
-    const spliceBase = getSpliceBaseUrl(env);
-
-    // ── Step 1: Resolve bridge operator party ────────────────────────
-    // Get bridge operator's party from their Splice wallet status
-    const bridgeToken = generateSpliceToken(env, bridgeUser);
-    const bridgeStatusRes = await fetch(`${spliceBase}/wallet/status`, {
-      headers: { 'Authorization': `Bearer ${bridgeToken}` },
-    });
-    if (!bridgeStatusRes.ok) {
-      const err = await bridgeStatusRes.text();
-      return jsonResponse({ error: `Bridge operator status failed: ${err}` }, 500);
-    }
-    const bridgeStatus = await bridgeStatusRes.json() as { party_id?: string; party?: string };
-    const bridgeParty = bridgeStatus.party_id || bridgeStatus.party;
-    if (!bridgeParty) {
-      return jsonResponse({ error: 'Could not resolve bridge operator party' }, 500);
+    if (!env.PROXY_API_URL || !env.PROXY_API_KEY) {
+      return jsonResponse({ error: 'Proxy API not configured' }, 500);
     }
 
-    // ── Step 2: Custodian sends CC to bridge operator ────────────────
-    const custodianToken = generateSpliceToken(env, custodianUser);
-    const expiresAtMicros = (Date.now() + 60 * 60 * 1000) * 1000;
-    const trackingId = `cc-swap-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-
-    const offerRes = await fetch(`${spliceBase}/wallet/transfer-offers`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${custodianToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        receiver_party_id: bridgeParty,
-        amount: ccAmount.toString(),
-        description: 'CC→USDC swap (liquidation)',
-        expires_at: expiresAtMicros.toString(),
-        tracking_id: trackingId,
-      }),
-    });
-    if (!offerRes.ok) {
-      const err = await offerRes.text();
-      return jsonResponse({ error: `CC transfer offer failed: ${err}` }, 500);
-    }
-    const offerData = await offerRes.json() as { offer_contract_id?: string; contract_id?: string };
-    const offerCid = offerData.offer_contract_id || offerData.contract_id || '';
-
-    // Accept the offer as bridge operator
-    let ccAccepted = false;
-    if (offerCid) {
-      const acceptRes = await fetch(`${spliceBase}/wallet/transfer-offers/${offerCid}/accept`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${bridgeToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: '{}',
-      });
-      ccAccepted = acceptRes.ok;
-      if (!ccAccepted) {
-        console.warn(`[cc-to-usdc] Bridge operator failed to accept CC offer: ${acceptRes.status}`);
-      }
+    const custodianParty = env.CUSTODIAN_PARTY;
+    const bridgeParty = env.BRIDGE_OPERATOR_PARTY || await env.PRIVAMARGIN_CONFIG?.get('bridgeOperatorParty') || '';
+    if (!custodianParty || !bridgeParty) {
+      return jsonResponse({ error: 'CUSTODIAN_PARTY or BRIDGE_OPERATOR_PARTY not configured' }, 500);
     }
 
-    console.log(`[cc-to-usdc] Step 1 done: custodian→bridge ${ccAmount} CC, offer=${offerCid}, accepted=${ccAccepted}`);
-
-    // ── Step 3: Bridge operator sends USDC to custodian ──────────────
-    const templateId = env.USDC_TEMPLATE_ID;
-    if (!templateId) {
-      return jsonResponse({
-        error: 'USDC_TEMPLATE_ID not configured',
-        ccTransferred: ccAccepted,
-      }, 500);
+    // ── Step 1: Transfer CC from custodian to bridge operator ──────────
+    const ccTemplateId = env.CC_TEMPLATE_ID || await env.PRIVAMARGIN_CONFIG?.get('CC_TEMPLATE_ID') || '';
+    if (!ccTemplateId) {
+      return jsonResponse({ error: 'CC_TEMPLATE_ID not configured' }, 500);
     }
 
-    // Get admin party
-    const adminUser = await cantonFetch<{ user: { primaryParty: string } }>(
-      env, `/users/${env.SPLICE_ADMIN_USER || 'app-user'}`
-    );
-    const adminPartyId = adminUser.user.primaryParty;
+    const ccContracts = await proxyQuery(env.PROXY_API_URL, env.PROXY_API_KEY, ccTemplateId);
+    const custodianCC = ccContracts.filter(c => c.payload.owner === custodianParty);
 
-    // Get custodian party
-    const custodianParty = await env.PRIVAMARGIN_CONFIG.get('custodianParty');
-    if (!custodianParty) {
-      return jsonResponse({
-        error: 'custodianParty not configured in KV',
-        ccTransferred: ccAccepted,
-      }, 500);
+    let ccAvailable = 0;
+    for (const c of custodianCC) {
+      ccAvailable += parseFloat(c.payload.amount as string) || 0;
+    }
+    if (ccAvailable < ccAmount) {
+      return jsonResponse({ error: `Insufficient custodian CC: have ${ccAvailable}, need ${ccAmount}` }, 400);
     }
 
-    // Query bridge operator's USDCHolding contracts
-    const offset = await cantonFetch<{ offset: number }>(env, '/state/ledger-end');
-    const rawContracts = await cantonFetch<Array<{
-      contractEntry: {
-        JsActiveContract: {
-          createdEvent: {
-            contractId: string;
-            templateId: string;
-            createArgument: Record<string, unknown>;
-          }
-        }
-      }
-    }>>(env, '/state/active-contracts', {
-      filter: {
-        filtersByParty: {
-          [adminPartyId]: {
-            cumulative: [{
-              identifierFilter: {
-                TemplateFilter: {
-                  value: { templateId, includeCreatedEventBlob: false }
-                }
-              }
-            }]
-          }
-        }
-      },
-      verbose: true,
-      activeAtOffset: offset.offset,
-    });
-
-    // Filter for bridge operator's USDC holdings
-    const contracts = (rawContracts || [])
-      .map(c => ({
-        contractId: c.contractEntry.JsActiveContract.createdEvent.contractId,
-        tid: c.contractEntry.JsActiveContract.createdEvent.templateId,
-        payload: c.contractEntry.JsActiveContract.createdEvent.createArgument,
-      }))
-      .filter(c => c.tid === templateId && c.payload.owner === bridgeParty);
-
-    let available = 0;
-    for (const c of contracts) {
-      available += parseFloat(c.payload.amount as string) || 0;
-    }
-
-    if (available < usdcAmount) {
-      return jsonResponse({
-        error: `Bridge operator insufficient USDC: have ${available.toFixed(6)}, need ${usdcAmount}`,
-        ccTransferred: ccAccepted,
-      }, 400);
-    }
-
-    // Transfer USDC from bridge operator to custodian
-    const sorted = [...contracts].sort((a, b) =>
+    // Sort and transfer CC
+    const ccSorted = [...custodianCC].sort((a, b) =>
       (parseFloat(b.payload.amount as string) || 0) - (parseFloat(a.payload.amount as string) || 0)
     );
 
-    let remaining = usdcAmount;
+    let ccRemaining = ccAmount;
+    let ccTransferred = false;
+
+    for (const contract of ccSorted) {
+      if (ccRemaining <= 0) break;
+      const amt = parseFloat(contract.payload.amount as string) || 0;
+
+      if (amt <= ccRemaining) {
+        await proxyExercise(env.PROXY_API_URL, env.PROXY_API_KEY, contract.contractId, ccTemplateId, 'Transfer', { newOwner: bridgeParty });
+        ccRemaining -= amt;
+      } else {
+        const splitResult = await proxyExercise(env.PROXY_API_URL, env.PROXY_API_KEY, contract.contractId, ccTemplateId, 'Split', { splitAmount: ccRemaining.toString() });
+        for (const evt of (splitResult.events || [])) {
+          const evtAmt = parseFloat(evt.payload.amount as string) || 0;
+          if (Math.abs(evtAmt - ccRemaining) < 0.000001) {
+            await proxyExercise(env.PROXY_API_URL, env.PROXY_API_KEY, evt.contractId, ccTemplateId, 'Transfer', { newOwner: bridgeParty });
+            break;
+          }
+        }
+        ccRemaining = 0;
+      }
+    }
+    ccTransferred = ccRemaining <= 0;
+
+    console.log(`[cc-to-usdc] Step 1: custodian→bridge ${ccAmount} CC, transferred=${ccTransferred}`);
+
+    // ── Step 2: Transfer USDC from bridge operator to custodian ────────
+    const usdcTemplateId = env.USDC_TEMPLATE_ID;
+    if (!usdcTemplateId) {
+      return jsonResponse({ error: 'USDC_TEMPLATE_ID not configured', ccTransferred }, 500);
+    }
+
+    const usdcContracts = await proxyQuery(env.PROXY_API_URL, env.PROXY_API_KEY, usdcTemplateId);
+    const bridgeUSDC = usdcContracts.filter(c => c.payload.owner === bridgeParty);
+
+    let usdcAvailable = 0;
+    for (const c of bridgeUSDC) {
+      usdcAvailable += parseFloat(c.payload.amount as string) || 0;
+    }
+    if (usdcAvailable < usdcAmount) {
+      return jsonResponse({
+        error: `Bridge operator insufficient USDC: have ${usdcAvailable.toFixed(6)}, need ${usdcAmount}`,
+        ccTransferred,
+      }, 400);
+    }
+
+    const usdcSorted = [...bridgeUSDC].sort((a, b) =>
+      (parseFloat(b.payload.amount as string) || 0) - (parseFloat(a.payload.amount as string) || 0)
+    );
+
+    let usdcRemaining = usdcAmount;
     const transferredIds: string[] = [];
 
-    for (const contract of sorted) {
-      if (remaining <= 0) break;
-      const contractAmount = parseFloat(contract.payload.amount as string) || 0;
+    for (const contract of usdcSorted) {
+      if (usdcRemaining <= 0) break;
+      const amt = parseFloat(contract.payload.amount as string) || 0;
 
-      if (contractAmount <= remaining) {
-        await exerciseChoice(env, adminPartyId, contract.contractId, templateId, 'Transfer', { newOwner: custodianParty });
+      if (amt <= usdcRemaining) {
+        await proxyExercise(env.PROXY_API_URL, env.PROXY_API_KEY, contract.contractId, usdcTemplateId, 'Transfer', { newOwner: custodianParty });
         transferredIds.push(contract.contractId);
-        remaining -= contractAmount;
+        usdcRemaining -= amt;
       } else {
-        const splitResult = await exerciseChoice(env, adminPartyId, contract.contractId, templateId, 'Split', {
-          splitAmount: remaining.toFixed(10),
+        const splitResult = await proxyExercise(env.PROXY_API_URL, env.PROXY_API_KEY, contract.contractId, usdcTemplateId, 'Split', {
+          splitAmount: usdcRemaining.toFixed(10),
         });
-        for (const evt of splitResult.created) {
-          const evtAmount = parseFloat(evt.payload.amount as string) || 0;
-          if (Math.abs(evtAmount - remaining) < 0.000001) {
-            await exerciseChoice(env, adminPartyId, evt.contractId, templateId, 'Transfer', { newOwner: custodianParty });
+        for (const evt of (splitResult.events || [])) {
+          const evtAmt = parseFloat(evt.payload.amount as string) || 0;
+          if (Math.abs(evtAmt - usdcRemaining) < 0.000001) {
+            await proxyExercise(env.PROXY_API_URL, env.PROXY_API_KEY, evt.contractId, usdcTemplateId, 'Transfer', { newOwner: custodianParty });
             transferredIds.push(evt.contractId);
             break;
           }
         }
-        remaining = 0;
+        usdcRemaining = 0;
       }
     }
 
-    console.log(`[cc-to-usdc] Step 2 done: bridge→custodian ${usdcAmount} USDC, contracts=${transferredIds.length}`);
+    console.log(`[cc-to-usdc] Step 2: bridge→custodian ${usdcAmount} USDC, contracts=${transferredIds.length}`);
 
     return jsonResponse({
       success: true,
-      ccTransferred: ccAccepted,
+      ccTransferred,
       usdcReceived: transferredIds.length > 0,
       ccAmount,
       usdcAmount,
-      trackingId,
     });
   } catch (error) {
     console.error('[cc-to-usdc] Error:', error);
@@ -294,39 +168,3 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     }, 500);
   }
 };
-
-async function exerciseChoice(
-  env: Env,
-  actAs: string,
-  contractId: string,
-  templateId: string,
-  choice: string,
-  argument: Record<string, unknown>,
-): Promise<{ created: Array<{ contractId: string; payload: Record<string, unknown> }> }> {
-  const commandId = crypto.randomUUID();
-  const result = await cantonFetch<{
-    transactionTree: {
-      eventsById: Record<string, {
-        CreatedTreeEvent?: { value: { contractId: string; createArgument: Record<string, unknown> } };
-      }>;
-    }
-  }>(env, '/commands/submit-and-wait-for-transaction-tree', {
-    commands: [{
-      ExerciseCommand: { templateId, contractId, choice, choiceArgument: argument }
-    }],
-    commandId,
-    actAs: [actAs],
-    readAs: [actAs],
-  });
-
-  const created: Array<{ contractId: string; payload: Record<string, unknown> }> = [];
-  for (const [, event] of Object.entries(result.transactionTree?.eventsById || {})) {
-    if (event.CreatedTreeEvent) {
-      created.push({
-        contractId: event.CreatedTreeEvent.value.contractId,
-        payload: event.CreatedTreeEvent.value.createArgument,
-      });
-    }
-  }
-  return { created };
-}

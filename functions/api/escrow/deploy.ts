@@ -30,6 +30,7 @@ interface Env {
   RPC_BASE_SEPOLIA: string;
   RPC_ETHEREUM: string;
   RPC_BASE: string;
+  PRIVAMARGIN_CONFIG: KVNamespace;
 }
 
 // VaultEscrow bytecode — constructor(address _owner, address _liquidator,
@@ -81,7 +82,9 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     }
   }
 
-  if (!env.DEPLOYER_PRIVATE_KEY) {
+  // Check env var first, then KV
+  const deployerKey = env.DEPLOYER_PRIVATE_KEY || await env.PRIVAMARGIN_CONFIG?.get('deployerPrivateKey') || '';
+  if (!deployerKey) {
     return jsonResponse({ error: 'Deployer not configured' }, 500);
   }
 
@@ -114,7 +117,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       + padAddress(config.usdc)) as Hex;
 
     // Create account from private key
-    const rawKey = env.DEPLOYER_PRIVATE_KEY.trim();
+    const rawKey = deployerKey.trim();
     const privateKey = rawKey.startsWith('0x')
       ? rawKey as Hex
       : `0x${rawKey}` as Hex;
@@ -181,13 +184,16 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
 // GET /api/escrow/deploy — status endpoint
 export const onRequestGet: PagesFunction<Env> = async (context) => {
   const { env } = context;
-  const hasKey = !!env.DEPLOYER_PRIVATE_KEY;
+  const keyFromEnv = env.DEPLOYER_PRIVATE_KEY || '';
+  const keyFromKV = await env.PRIVAMARGIN_CONFIG?.get('deployerPrivateKey') || '';
+  const rawKey = keyFromEnv || keyFromKV;
+  const hasKey = !!rawKey;
 
   let deployerAddress: string | null = null;
   if (hasKey) {
     try {
-      const raw = env.DEPLOYER_PRIVATE_KEY.trim();
-      const privateKey = raw.startsWith('0x') ? raw as Hex : `0x${raw}` as Hex;
+      const trimmed = rawKey.trim();
+      const privateKey = trimmed.startsWith('0x') ? trimmed as Hex : `0x${trimmed}` as Hex;
       const account = privateKeyToAccount(privateKey);
       deployerAddress = account.address;
     } catch {
@@ -197,7 +203,8 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
 
   return jsonResponse({
     name: 'privamargin-escrow-deployer',
-    configured: hasKey && !!env.API_SECRET,
+    configured: hasKey,
     deployerAddress,
+    source: keyFromEnv ? 'env' : keyFromKV ? 'kv' : 'none',
   });
 };

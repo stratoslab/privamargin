@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef, Fragment } from 'react';
 import {
-  Box, Typography, Button, Grid, CircularProgress, Alert,
+  Box, Typography, Button, Grid, CircularProgress, Alert, TextField,
   Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
   Collapse, IconButton, Chip,
 } from '@mui/material';
 import {
-  Add, Visibility, VisibilityOff, Lock, LockOpen, TrendingUp, Warning, Shield,
+  Add, Visibility, VisibilityOff, Lock, LockOpen, TrendingUp, Warning, Shield, SwapHoriz,
   Schedule, ExpandMore, ExpandLess, CheckCircle,
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
@@ -686,10 +686,12 @@ function BrokerDashboard({ user }: { user: AuthUser }) {
 // Custodian Status Panel — shown on operator dashboard
 function CustodianPanel() {
   const [custodianParty, setCustodianParty] = useState<string | null>(null);
+  const [inputValue, setInputValue] = useState('');
   const [loading, setLoading] = useState(true);
-  const [provisioning, setProvisioning] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>('');
   const [success, setSuccess] = useState(false);
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => {
     loadCustodianStatus();
@@ -705,23 +707,31 @@ function CustodianPanel() {
     setLoading(false);
   };
 
-  const handleProvision = async () => {
-    setProvisioning(true);
+  const handleSave = async () => {
+    const partyId = inputValue.trim();
+    if (!partyId) return;
+    setSaving(true);
     setError('');
     setSuccess(false);
     try {
-      const res = await fetch('/api/admin/provision-custodian', { method: 'POST' });
+      const res = await fetch('/api/admin/provision-custodian', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ partyId }),
+      });
       const data = await res.json() as { success: boolean; custodianParty?: string; error?: string };
       if (data.success && data.custodianParty) {
         setCustodianParty(data.custodianParty);
         setSuccess(true);
+        setEditing(false);
+        setInputValue('');
       } else {
-        setError(data.error || 'Failed to provision custodian');
+        setError(data.error || 'Failed to configure custodian');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Network error');
     }
-    setProvisioning(false);
+    setSaving(false);
   };
 
   if (loading) return null;
@@ -736,7 +746,7 @@ function CustodianPanel() {
         mb: 3,
       }}
     >
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: custodianParty || editing ? 2 : 0 }}>
         <Box
           sx={{
             width: 40,
@@ -758,29 +768,70 @@ function CustodianPanel() {
         <Box sx={{ flex: 1 }}>
           <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'white' }}>Vault Custodian</Typography>
           <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>
-            {custodianParty ? 'Dedicated custody party active' : 'Not provisioned — deposits go to operator wallet'}
+            {custodianParty ? 'Dedicated custody party active' : 'Enter a Canton party ID for the vault custodian'}
           </Typography>
         </Box>
-        {!custodianParty && (
+        {custodianParty && !editing && (
           <Button
-            variant="contained"
-            onClick={handleProvision}
-            disabled={provisioning}
-            startIcon={provisioning ? <CircularProgress size={16} sx={{ color: 'inherit' }} /> : undefined}
-            sx={{
-              bgcolor: '#ffa500',
-              color: '#0a0e14',
-              fontWeight: 600,
-              textTransform: 'none',
-              '&:hover': { bgcolor: '#e69500' },
-            }}
+            size="small"
+            onClick={() => { setEditing(true); setInputValue(custodianParty); setSuccess(false); }}
+            sx={{ color: 'rgba(255,255,255,0.5)', textTransform: 'none', fontSize: 12 }}
           >
-            {provisioning ? 'Provisioning...' : 'Provision Custodian'}
+            Change
           </Button>
         )}
       </Box>
 
-      {custodianParty && (
+      {/* Input for new or changed custodian */}
+      {(!custodianParty || editing) && (
+        <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'flex-start' }}>
+          <TextField
+            fullWidth
+            size="small"
+            placeholder="e.g. stratos-pivacustodian::1220d70d..."
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            sx={{
+              '& .MuiOutlinedInput-root': {
+                color: 'white',
+                fontSize: 13,
+                fontFamily: 'monospace',
+                bgcolor: 'rgba(255,255,255,0.03)',
+                '& fieldset': { borderColor: 'rgba(255,255,255,0.1)' },
+                '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.2)' },
+                '&.Mui-focused fieldset': { borderColor: '#00d4aa' },
+              },
+            }}
+          />
+          <Button
+            variant="contained"
+            onClick={handleSave}
+            disabled={saving || !inputValue.trim()}
+            sx={{
+              bgcolor: '#00d4aa',
+              color: '#0a0e14',
+              fontWeight: 600,
+              textTransform: 'none',
+              whiteSpace: 'nowrap',
+              '&:hover': { bgcolor: '#00b894' },
+            }}
+          >
+            {saving ? <CircularProgress size={18} sx={{ color: 'inherit' }} /> : 'Save'}
+          </Button>
+          {editing && (
+            <Button
+              size="small"
+              onClick={() => { setEditing(false); setInputValue(''); setError(''); }}
+              sx={{ color: 'rgba(255,255,255,0.4)', textTransform: 'none' }}
+            >
+              Cancel
+            </Button>
+          )}
+        </Box>
+      )}
+
+      {/* Current value display */}
+      {custodianParty && !editing && (
         <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 1.5 }}>
           <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', mb: 0.5 }}>Custodian Party ID</Typography>
           <Typography sx={{ fontSize: 12, color: '#00d4aa', fontFamily: 'monospace', wordBreak: 'break-all' }}>
@@ -790,31 +841,64 @@ function CustodianPanel() {
       )}
 
       {error && <Alert severity="error" sx={{ mt: 1.5 }}>{error}</Alert>}
-      {success && <Alert severity="success" sx={{ mt: 1.5 }}>Vault custodian provisioned successfully</Alert>}
+      {success && <Alert severity="success" sx={{ mt: 1.5 }}>Vault custodian configured</Alert>}
     </Box>
   );
 }
 
 
-// Escrow Deployer Panel — shows deployer EOA address and config status
+// Escrow Deployer Panel — configure deployer EOA from the dashboard
 function DeployerPanel() {
   const [deployerAddress, setDeployerAddress] = useState<string | null>(null);
   const [configured, setConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [inputValue, setInputValue] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState(false);
+  const [editing, setEditing] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await fetch('/api/escrow/deploy');
-        const data = await res.json() as { deployerAddress?: string; configured?: boolean };
-        setDeployerAddress(data.deployerAddress || null);
-        setConfigured(!!data.configured);
-      } catch {
-        // ignore
+  const loadStatus = async () => {
+    try {
+      const res = await fetch('/api/escrow/deploy');
+      const data = await res.json() as { deployerAddress?: string; configured?: boolean };
+      setDeployerAddress(data.deployerAddress || null);
+      setConfigured(!!data.configured);
+    } catch {
+      // ignore
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { loadStatus(); }, []);
+
+  const handleSave = async () => {
+    const key = inputValue.trim();
+    if (!key) return;
+    setSaving(true);
+    setError('');
+    setSuccess(false);
+    try {
+      const res = await fetch('/api/escrow/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ privateKey: key }),
+      });
+      const data = await res.json() as { success: boolean; deployerAddress?: string; error?: string };
+      if (data.success && data.deployerAddress) {
+        setDeployerAddress(data.deployerAddress);
+        setConfigured(true);
+        setSuccess(true);
+        setEditing(false);
+        setInputValue('');
+      } else {
+        setError(data.error || 'Failed to configure deployer');
       }
-      setLoading(false);
-    })();
-  }, []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Network error');
+    }
+    setSaving(false);
+  };
 
   if (loading) return null;
 
@@ -828,7 +912,7 @@ function DeployerPanel() {
         mb: 3,
       }}
     >
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: deployerAddress ? 2 : 0 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: configured || editing ? 2 : 0 }}>
         <Box
           sx={{
             width: 40,
@@ -846,12 +930,71 @@ function DeployerPanel() {
         <Box sx={{ flex: 1 }}>
           <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'white' }}>Escrow Deployer</Typography>
           <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>
-            {configured ? 'Dedicated deployer EOA configured' : 'Not configured — set DEPLOYER_PRIVATE_KEY and API_SECRET'}
+            {configured ? 'Dedicated deployer EOA configured' : 'Enter a private key for the escrow deployer EOA'}
           </Typography>
         </Box>
+        {configured && !editing && (
+          <Button
+            size="small"
+            onClick={() => { setEditing(true); setSuccess(false); }}
+            sx={{ color: 'rgba(255,255,255,0.5)', textTransform: 'none', fontSize: 12 }}
+          >
+            Change
+          </Button>
+        )}
       </Box>
 
-      {deployerAddress && (
+      {/* Input for new or changed deployer key */}
+      {(!configured || editing) && (
+        <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'flex-start' }}>
+          <TextField
+            fullWidth
+            size="small"
+            type="password"
+            placeholder="0x... (hex-encoded private key)"
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            sx={{
+              '& .MuiOutlinedInput-root': {
+                color: 'white',
+                fontSize: 13,
+                fontFamily: 'monospace',
+                bgcolor: 'rgba(255,255,255,0.03)',
+                '& fieldset': { borderColor: 'rgba(255,255,255,0.1)' },
+                '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.2)' },
+                '&.Mui-focused fieldset': { borderColor: '#60a5fa' },
+              },
+            }}
+          />
+          <Button
+            variant="contained"
+            onClick={handleSave}
+            disabled={saving || !inputValue.trim()}
+            sx={{
+              bgcolor: '#60a5fa',
+              color: '#0a0e14',
+              fontWeight: 600,
+              textTransform: 'none',
+              whiteSpace: 'nowrap',
+              '&:hover': { bgcolor: '#3b82f6' },
+            }}
+          >
+            {saving ? <CircularProgress size={18} sx={{ color: 'inherit' }} /> : 'Save'}
+          </Button>
+          {editing && (
+            <Button
+              size="small"
+              onClick={() => { setEditing(false); setInputValue(''); setError(''); }}
+              sx={{ color: 'rgba(255,255,255,0.4)', textTransform: 'none' }}
+            >
+              Cancel
+            </Button>
+          )}
+        </Box>
+      )}
+
+      {/* Current deployer address */}
+      {deployerAddress && !editing && (
         <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 1.5 }}>
           <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', mb: 0.5 }}>Deployer Address</Typography>
           <Typography sx={{ fontSize: 12, color: '#60a5fa', fontFamily: 'monospace', wordBreak: 'break-all' }}>
@@ -859,6 +1002,163 @@ function DeployerPanel() {
           </Typography>
         </Box>
       )}
+
+      {error && <Alert severity="error" sx={{ mt: 1.5 }}>{error}</Alert>}
+      {success && <Alert severity="success" sx={{ mt: 1.5 }}>Escrow deployer configured</Alert>}
+    </Box>
+  );
+}
+
+// Bridge Operator Panel — configure bridge operator party from dashboard
+function BridgeOperatorPanel() {
+  const [bridgeParty, setBridgeParty] = useState<string | null>(null);
+  const [inputValue, setInputValue] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState(false);
+  const [editing, setEditing] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/admin/bridge-operator');
+        const data = await res.json() as { bridgeOperatorParty?: string };
+        setBridgeParty(data.bridgeOperatorParty || null);
+      } catch { /* ignore */ }
+      setLoading(false);
+    })();
+  }, []);
+
+  const handleSave = async () => {
+    const partyId = inputValue.trim();
+    if (!partyId) return;
+    setSaving(true);
+    setError('');
+    setSuccess(false);
+    try {
+      const res = await fetch('/api/admin/bridge-operator', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ partyId }),
+      });
+      const data = await res.json() as { success: boolean; bridgeOperatorParty?: string; error?: string };
+      if (data.success && data.bridgeOperatorParty) {
+        setBridgeParty(data.bridgeOperatorParty);
+        setSuccess(true);
+        setEditing(false);
+        setInputValue('');
+      } else {
+        setError(data.error || 'Failed to configure bridge operator');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Network error');
+    }
+    setSaving(false);
+  };
+
+  if (loading) return null;
+
+  return (
+    <Box
+      sx={{
+        bgcolor: '#111820',
+        borderRadius: '12px',
+        border: `1px solid ${bridgeParty ? 'rgba(168,85,247,0.2)' : 'rgba(255,165,0,0.2)'}`,
+        p: 3,
+        mb: 3,
+      }}
+    >
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: bridgeParty || editing ? 2 : 0 }}>
+        <Box
+          sx={{
+            width: 40,
+            height: 40,
+            borderRadius: '10px',
+            bgcolor: bridgeParty ? 'rgba(168,85,247,0.1)' : 'rgba(255,165,0,0.1)',
+            border: `2px solid ${bridgeParty ? '#a855f7' : '#ffa500'}`,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <SwapHoriz sx={{ color: bridgeParty ? '#a855f7' : '#ffa500', fontSize: 20 }} />
+        </Box>
+        <Box sx={{ flex: 1 }}>
+          <Typography sx={{ fontSize: 16, fontWeight: 600, color: 'white' }}>Bridge Operator</Typography>
+          <Typography sx={{ fontSize: 13, color: 'rgba(255,255,255,0.4)' }}>
+            {bridgeParty ? 'Bridge operator party configured' : 'Enter the bridge operator Canton party ID'}
+          </Typography>
+        </Box>
+        {bridgeParty && !editing && (
+          <Button
+            size="small"
+            onClick={() => { setEditing(true); setInputValue(bridgeParty); setSuccess(false); }}
+            sx={{ color: 'rgba(255,255,255,0.5)', textTransform: 'none', fontSize: 12 }}
+          >
+            Change
+          </Button>
+        )}
+      </Box>
+
+      {(!bridgeParty || editing) && (
+        <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'flex-start' }}>
+          <TextField
+            fullWidth
+            size="small"
+            placeholder="e.g. stratos-bridge::1220d70d..."
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            sx={{
+              '& .MuiOutlinedInput-root': {
+                color: 'white',
+                fontSize: 13,
+                fontFamily: 'monospace',
+                bgcolor: 'rgba(255,255,255,0.03)',
+                '& fieldset': { borderColor: 'rgba(255,255,255,0.1)' },
+                '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.2)' },
+                '&.Mui-focused fieldset': { borderColor: '#a855f7' },
+              },
+            }}
+          />
+          <Button
+            variant="contained"
+            onClick={handleSave}
+            disabled={saving || !inputValue.trim()}
+            sx={{
+              bgcolor: '#a855f7',
+              color: 'white',
+              fontWeight: 600,
+              textTransform: 'none',
+              whiteSpace: 'nowrap',
+              '&:hover': { bgcolor: '#9333ea' },
+            }}
+          >
+            {saving ? <CircularProgress size={18} sx={{ color: 'inherit' }} /> : 'Save'}
+          </Button>
+          {editing && (
+            <Button
+              size="small"
+              onClick={() => { setEditing(false); setInputValue(''); setError(''); }}
+              sx={{ color: 'rgba(255,255,255,0.4)', textTransform: 'none' }}
+            >
+              Cancel
+            </Button>
+          )}
+        </Box>
+      )}
+
+      {bridgeParty && !editing && (
+        <Box sx={{ bgcolor: 'rgba(255,255,255,0.03)', borderRadius: '8px', p: 1.5 }}>
+          <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', mb: 0.5 }}>Bridge Operator Party ID</Typography>
+          <Typography sx={{ fontSize: 12, color: '#a855f7', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+            {bridgeParty}
+          </Typography>
+        </Box>
+      )}
+
+      {error && <Alert severity="error" sx={{ mt: 1.5 }}>{error}</Alert>}
+      {success && <Alert severity="success" sx={{ mt: 1.5 }}>Bridge operator configured</Alert>}
     </Box>
   );
 }
@@ -1293,6 +1593,9 @@ function OperatorDashboard({ user }: { user: AuthUser }) {
 
       {/* Deployer Panel */}
       <DeployerPanel />
+
+      {/* Bridge Operator Panel */}
+      <BridgeOperatorPanel />
 
       {/* Workflow Monitor */}
       <WorkflowLogPanel />

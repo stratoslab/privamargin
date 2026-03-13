@@ -90,8 +90,9 @@ export function RoleProvider({ user, children }: { user: AuthUser | null; childr
 
       if (!foundCantonRole) {
         // Fallback to KV for current user's role
+        // 'operator' is not a UserRole (fund/primebroker) — it's handled separately via isOperator
         const kvRole = (allData.roles || {})[partyId];
-        setRole((kvRole as UserRole) || null);
+        setRole(kvRole === 'operator' ? null : (kvRole as UserRole) || null);
       }
 
       // Check if an operator exists and if current user is the operator
@@ -104,7 +105,21 @@ export function RoleProvider({ user, children }: { user: AuthUser | null; childr
       const allData2 = await allRes2.json() as { roles?: Record<string, string> };
       const kvRoles = allData2.roles || {};
       const isAdditionalOperator = kvRoles[partyId] === 'operator';
-      setIsOperator(isPrimaryOperator || isAdditionalOperator);
+
+      // Also check devportal role — admin can assign 'operator' role centrally
+      let isDevportalOperator = false;
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+        const devportalRes = await fetch(`/api/devportal-role?party_id=${encodeURIComponent(partyId)}`, { signal: controller.signal });
+        clearTimeout(timeout);
+        const devportalData = await devportalRes.json() as { role?: string };
+        isDevportalOperator = devportalData.role === 'operator';
+      } catch {
+        // Non-fatal — devportal may not be configured or timed out
+      }
+
+      setIsOperator(isPrimaryOperator || isAdditionalOperator || isDevportalOperator);
     } catch (err) {
       console.error('Failed to fetch roles:', err);
     } finally {

@@ -1246,8 +1246,13 @@ export const vaultAPI = {
 
     // Get the RAW (non-aggregated) asset entries from the Daml contract
     const rawAssets = (vaults[0].payload as Record<string, unknown>).collateralAssets as Array<Record<string, unknown>> || [];
+    console.log(`[withdrawCantonAsset] vaultId=${vaultId}, symbol=${symbol}, rawAssets count=${rawAssets.length}, rawAssets=`, JSON.stringify(rawAssets.slice(0, 3)));
     const matchingEntries = rawAssets
-      .filter(a => resolveAssetSymbol(a.assetType as string, a.assetId as string) === symbol)
+      .filter(a => {
+        const resolved = resolveAssetSymbol(a.assetType as string, a.assetId as string);
+        console.log(`[withdrawCantonAsset] assetType=${a.assetType}, assetId=${a.assetId}, resolved=${resolved}, want=${symbol}`);
+        return resolved === symbol;
+      })
       .map(a => ({
         assetId: a.assetId as string,
         amount: typeof a.amount === 'string' ? parseFloat(a.amount) : (a.amount as number) || 0,
@@ -1267,14 +1272,11 @@ export const vaultAPI = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ receiverParty: owner, amount, receiverUser }),
       });
-      const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string; accepted?: boolean };
+      const withdrawData = await withdrawRes.json() as { success?: boolean; error?: string; contractId?: string };
       if (!withdrawRes.ok || !withdrawData.success) {
         throw new Error(`Custodian ${symbol} transfer failed: ${withdrawData.error || 'Unknown error'}`);
       }
-      if (!withdrawData.accepted) {
-        throw new Error(`Custodian ${symbol} transfer offer created but could not be accepted — CC did not arrive in wallet. Contact support.`);
-      }
-      console.log(`[${symbol} Withdraw] Custodian transfer of ${amount} ${symbol} created and accepted`);
+      console.log(`[${symbol} Withdraw] Custodian transfer of ${amount} ${symbol} completed (${withdrawData.contractId})`);
     } else if (symbol === 'USDC') {
       const withdrawRes = await fetch('/api/custodian/withdraw-usdc', {
         method: 'POST',

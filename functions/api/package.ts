@@ -18,10 +18,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const url = new URL(request.url);
   const baseUrl = `${url.protocol}//${url.host}`;
 
-  // Get operator party from KV (so it persists across deployments)
+  // Operator is derived from custodian party
   let operatorParty: string | null = null;
   try {
-    operatorParty = await env.PRIVAMARGIN_CONFIG.get('operatorParty');
+    operatorParty = await env.PRIVAMARGIN_CONFIG.get('custodianParty');
   } catch {
     // KV not configured or not available
   }

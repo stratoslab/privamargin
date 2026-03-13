@@ -31,7 +31,6 @@ const RELAY_CHAIN_IDS = [1, 11155111, 8453, 84532];
 
 export const onRequestGet: PagesFunction<Env> = async ({ env }) => {
   try {
-    const operatorParty = await env.PRIVAMARGIN_CONFIG.get('operatorParty');
     const custodianParty = await env.PRIVAMARGIN_CONFIG.get('custodianParty');
     const rawAssets = await env.PRIVAMARGIN_CONFIG.get('platformAssets');
     const platformAssets = rawAssets ? JSON.parse(rawAssets) : DEFAULT_PLATFORM_ASSETS;
@@ -45,9 +44,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ env }) => {
       }
     }
 
+    // Operator is always the custodian party
     return new Response(
       JSON.stringify({
-        operatorParty: operatorParty || null,
+        operatorParty: custodianParty || null,
         custodianParty: custodianParty || null,
         platformAssets,
         ...relayEntries,
@@ -68,15 +68,12 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
 
     let saved = false;
 
-    // Save operatorParty if provided
-    if (typeof body.operatorParty === 'string') {
-      await env.PRIVAMARGIN_CONFIG.put('operatorParty', body.operatorParty);
-      saved = true;
-    }
-
-    // Save custodianParty if provided
-    if (typeof body.custodianParty === 'string') {
-      await env.PRIVAMARGIN_CONFIG.put('custodianParty', body.custodianParty);
+    // Save custodianParty (also used as operator) if provided
+    // Accept either key — operatorParty is an alias for custodianParty
+    const custodianValue = typeof body.custodianParty === 'string' ? body.custodianParty
+      : typeof body.operatorParty === 'string' ? body.operatorParty : null;
+    if (custodianValue) {
+      await env.PRIVAMARGIN_CONFIG.put('custodianParty', custodianValue);
       saved = true;
     }
 

@@ -1,9 +1,12 @@
-name = "stratos-privamargin"
+name = "privamargin"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
+main = "src/worker.ts"
 
-# For Cloudflare Pages
-pages_build_output_dir = "./dist"
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
 
 # KV namespace for storing platform config (operator party, etc.)
 [[kv_namespaces]]
@@ -21,18 +24,21 @@ RPC_BASE_SEPOLIA = "https://base-sepolia-rpc.publicnode.com"
 RPC_ETHEREUM = "https://ethereum-rpc.publicnode.com"
 RPC_BASE = "https://base-rpc.publicnode.com"
 
-# Splice validator connection (for custodian CC transfers)
-SPLICE_HOST = "p1.cantondefi.com"
+# Devportal proxy API (custodian operations — query, create, exercise)
+PROXY_API_URL = "https://devportal.stratoslab.xyz/api/proxy"
+PROXY_API_KEY = "cwp_bf81e85224f54b14deedf85b069d4687b209af4a"
+CUSTODIAN_PARTY = "stratos-pivacustodian::1220d70d61f502d74060736d9f47e23530b6e905b0d14b5b4e238a497634483179e4"
+USDC_TEMPLATE_ID = "3b6cd0197bc2cd409db5f689f0ee07638cb0a73307196f729280c6924a431c9e:CantonUSDC.Token:USDCHolding"
+CC_TEMPLATE_ID = "c208d7ead1e4e9b610fc2054d0bf00716144ad444011bce0b02dcd6cd0cb8a23:Splice.Amulet:Amulet"
+TRANSFER_OFFER_TEMPLATE_ID = "690c1d47bac06db419db344d59a7a30c53fa3f5d961943fe1782cfc6c78794d8:Splice.Wallet.TransferOffer:TransferOffer"
+
+# Splice wallet API (needed for CC transfers — Amulet not visible to proxy's app-user)
+SPLICE_HOST = "devnet.cantondefi.com"
 SPLICE_PORT = "443"
 CANTON_AUTH_SECRET = "unsafe"
-CANTON_AUTH_AUDIENCE = "https://canton.network.global"
-CUSTODIAN_USER = "vault-custodian"
+CANTON_AUTH_AUDIENCE = "https://validator.example.com"
+# BRIDGE_OPERATOR_PARTY = ""    # Set to the bridge operator's party ID for CC↔USDC swaps
 
-# Canton JSON API v2 connection (for USDCHolding Split/Transfer)
-CANTON_JSON_HOST = "p1-json.cantondefi.com"
-SPLICE_ADMIN_USER = "app-user"
-USDC_TEMPLATE_ID = "3b6cd0197bc2cd409db5f689f0ee07638cb0a73307196f729280c6924a431c9e:CantonUSDC.Token:USDCHolding"
-
-# Secrets (set via `wrangler pages secret put`):
+# Secrets (set via `wrangler secret put`):
 # - DEPLOYER_PRIVATE_KEY  — hex-encoded private key for the dedicated deployer EOA
 # - API_SECRET            — shared secret for authenticating deploy requests

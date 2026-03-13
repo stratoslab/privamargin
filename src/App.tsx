@@ -787,15 +787,20 @@ function OperatorSetup({ user }: { user: AuthUser }) {
   );
 }
 
-// First-ever user bootstrap: become the operator
+// First-ever user bootstrap: auto-become the operator
 function BecomeOperator({ user }: { user: AuthUser }) {
   const { becomeOperator } = useRole();
-  const [claiming, setClaiming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [attempted, setAttempted] = useState(false);
 
-  const handleClaim = async () => {
-    setClaiming(true);
-    await becomeOperator();
-  };
+  useEffect(() => {
+    if (attempted) return;
+    setAttempted(true);
+    console.log('[PrivaMargin] Auto-initializing operator with first access user:', user.partyId);
+    becomeOperator().catch(err => {
+      setError(err instanceof Error ? err.message : 'Failed to initialize operator');
+    });
+  }, [attempted, becomeOperator, user.partyId]);
 
   return (
     <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', bgcolor: '#0a0e14' }}>
@@ -816,33 +821,36 @@ function BecomeOperator({ user }: { user: AuthUser }) {
           <Box sx={{ width: 12, height: 12, borderRadius: '50%', bgcolor: '#f59e0b' }} />
         </Box>
         <Typography sx={{ fontSize: 24, fontWeight: 600, color: 'white', mb: 1, fontFamily: '"Outfit", sans-serif' }}>
-          Welcome to PrivaMargin
+          Initializing PrivaMargin
         </Typography>
-        <Typography sx={{ fontSize: 14, color: 'rgba(255,255,255,0.5)', mb: 1, fontFamily: '"Outfit", sans-serif' }}>
-          No operator has been configured yet. The operator is the system administrator who assigns primebrokers, who in turn onboard fund accounts.
-        </Typography>
-        <Typography sx={{ fontSize: 12, color: 'rgba(255,255,255,0.35)', mb: 3, fontFamily: 'monospace' }}>
-          Party: {user.partyId?.split('::')[0] || user.id}
-        </Typography>
-        <Button
-          variant="contained"
-          onClick={handleClaim}
-          disabled={claiming}
-          sx={{
-            bgcolor: '#f59e0b',
-            color: '#0a0e14',
-            fontWeight: 700,
-            px: 5,
-            py: 1.5,
-            borderRadius: '10px',
-            textTransform: 'none',
-            fontSize: 15,
-            '&:hover': { bgcolor: '#d97706' },
-            '&.Mui-disabled': { bgcolor: 'rgba(245,158,11,0.4)', color: 'rgba(10,14,20,0.5)' },
-          }}
-        >
-          {claiming ? 'Setting up...' : 'Become Operator'}
-        </Button>
+        {error ? (
+          <>
+            <Typography sx={{ fontSize: 14, color: '#ef4444', mb: 2, fontFamily: '"Outfit", sans-serif' }}>
+              {error}
+            </Typography>
+            <Button
+              variant="contained"
+              onClick={() => { setAttempted(false); setError(null); }}
+              sx={{
+                bgcolor: '#f59e0b',
+                color: '#0a0e14',
+                fontWeight: 700,
+                px: 5,
+                py: 1.5,
+                borderRadius: '10px',
+                textTransform: 'none',
+                fontSize: 15,
+                '&:hover': { bgcolor: '#d97706' },
+              }}
+            >
+              Retry
+            </Button>
+          </>
+        ) : (
+          <Typography sx={{ fontSize: 14, color: 'rgba(255,255,255,0.5)', mb: 1, fontFamily: '"Outfit", sans-serif' }}>
+            Setting up with you as operator...
+          </Typography>
+        )}
       </Box>
     </Box>
   );

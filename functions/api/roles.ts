@@ -58,13 +58,13 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
       );
     }
 
-    // Authorization: operator can assign operator/primebroker, primebroker can assign fund
-    const operatorParty = await env.PRIVAMARGIN_CONFIG.get('operatorParty');
+    // Authorization: operator (= custodian) can assign operator/primebroker, primebroker can assign fund
+    const custodianParty = await env.PRIVAMARGIN_CONFIG.get('custodianParty');
     const rolesRaw = await env.PRIVAMARGIN_CONFIG.get('roles');
     const roles: Record<string, string> = rolesRaw ? JSON.parse(rolesRaw) : {};
 
     if (body.requestingParty) {
-      const isOperator = body.requestingParty === operatorParty || roles[body.requestingParty] === 'operator';
+      const isOperator = body.requestingParty === custodianParty || roles[body.requestingParty] === 'operator';
       const requesterRole = roles[body.requestingParty];
       const isBroker = requesterRole === 'primebroker';
 
@@ -114,13 +114,13 @@ export const onRequestDelete: PagesFunction<Env> = async ({ request, env }) => {
       );
     }
 
-    // Authorization: operator or prime broker can remove roles
-    const operatorParty = await env.PRIVAMARGIN_CONFIG.get('operatorParty');
+    // Authorization: operator (= custodian) or prime broker can remove roles
+    const custodianParty = await env.PRIVAMARGIN_CONFIG.get('custodianParty');
     const rolesRaw2 = await env.PRIVAMARGIN_CONFIG.get('roles');
     const currentRoles: Record<string, string> = rolesRaw2 ? JSON.parse(rolesRaw2) : {};
 
     if (body.requestingParty) {
-      const isOperator = body.requestingParty === operatorParty || currentRoles[body.requestingParty] === 'operator';
+      const isOperator = body.requestingParty === custodianParty || currentRoles[body.requestingParty] === 'operator';
       const requesterRole = currentRoles[body.requestingParty];
       const isBroker = requesterRole === 'primebroker';
       const targetRole = currentRoles[body.partyId];

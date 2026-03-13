@@ -6,6 +6,12 @@ export default defineConfig({
   server: {
     port: 5175,
   },
+  resolve: {
+    preserveSymlinks: true,
+    alias: {
+      '@stratos-wallet/sdk': '/root/cantonlocal/stratos-wallet-sdk/dist/index.mjs',
+    },
+  },
   build: {
     outDir: 'dist',
     sourcemap: true,
